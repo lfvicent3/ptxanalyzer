@@ -177,12 +177,23 @@ class PTXAnalyzer:
         btn_bar  = w.Button(description="📈 Barras", button_style="info")
         btn_time = w.Button(description="📉 Timeline", button_style="info")
         btn_reg  = w.Button(description="🗂️ Registradores", button_style="info")
-        btn_pie.on_click(lambda _: self.plot_distribution())
-        btn_bar.on_click(lambda _: self.plot_categories())
-        btn_time.on_click(lambda _: self.plot_timeline())
-        btn_reg.on_click(lambda _: self.plot_registers())
+
+        out_charts = w.Output()
+
+        def _make_handler(plot_fn):
+            def _handler(_):
+                with out_charts:
+                    out_charts.clear_output(wait=True)
+                    plot_fn()
+            return _handler
+
+        btn_pie.on_click(_make_handler(self.plot_distribution))
+        btn_bar.on_click(_make_handler(self.plot_categories))
+        btn_time.on_click(_make_handler(self.plot_timeline))
+        btn_reg.on_click(_make_handler(self.plot_registers))
+
         chart_btns = w.HBox([btn_pie, btn_bar, btn_time, btn_reg])
-        tab0 = w.VBox([overview_html, chart_btns])
+        tab0 = w.VBox([overview_html, chart_btns, out_charts])
 
         # ── Aba 1: Instruções ───────────────────────────────────────────────
         search_box = w.Text(placeholder="Buscar opcode ou operando…",
