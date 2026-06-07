@@ -4,7 +4,7 @@ setup(
     name="ptx_analyzer",
     version="1.0.0",
     description="Ferramenta de análise e visualização de código PTX para validação de algoritmos de ordenação e grid-stride loops.",
-    author="Luiz",
+    author="Henrique, Lucas, Luiz",
     packages=find_packages(),
     install_requires=[
         "plotly",
