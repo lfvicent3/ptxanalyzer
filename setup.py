@@ -9,6 +9,7 @@ setup(
     install_requires=[
         "plotly",
         "ipywidgets",
+        "nbformat",
     ],
     python_requires=">=3.7",
 )
