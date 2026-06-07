@@ -184,7 +184,11 @@ class PTXAnalyzer:
             def _handler(_):
                 with out_charts:
                     out_charts.clear_output(wait=True)
-                    plot_fn()
+                    fig = plot_fn()
+                    if fig:
+                        import plotly.graph_objects as go
+                        from IPython.display import display
+                        display(go.FigureWidget(fig))
             return _handler
 
         btn_pie.on_click(_make_handler(self.plot_distribution))

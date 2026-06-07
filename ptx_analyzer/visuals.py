@@ -36,7 +36,7 @@ def plot_category_pie(kernel: PTXKernel):
         title=f"Distribuição — {kernel.name}",
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_category_bar(kernel: PTXKernel):
@@ -59,7 +59,7 @@ def plot_category_bar(kernel: PTXKernel):
         yaxis_title="Nº de Instruções",
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_instruction_timeline(kernel: PTXKernel, max_points: int = 400):
@@ -92,7 +92,7 @@ def plot_instruction_timeline(kernel: PTXKernel, max_points: int = 400):
         yaxis=dict(tickvals=list(range(len(cats))), ticktext=cats),
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_register_types(kernel: PTXKernel):
@@ -120,7 +120,7 @@ def plot_register_types(kernel: PTXKernel):
         yaxis_title="Quantidade",
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_instruction_mix_stacked(kernels: Dict[str, "PTXKernel"]):
@@ -154,7 +154,7 @@ def plot_instruction_mix_stacked(kernels: Dict[str, "PTXKernel"]):
         legend=dict(orientation="h", y=-0.25),
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_roofline(kernels: Dict[str, "PTXKernel"],
@@ -242,7 +242,7 @@ def plot_roofline(kernels: Dict[str, "PTXKernel"],
                    type="log", gridcolor="#1e293b"),
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
 
 
 def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
@@ -278,4 +278,4 @@ def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
         yaxis_title="Nº de instruções de memória",
         **_DARK_LAYOUT,
     )
-    fig.show()
+    return fig
