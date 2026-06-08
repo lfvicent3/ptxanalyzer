@@ -78,8 +78,22 @@ class PTXAnalyzer:
     # ── construtores alternativos ────────────────────────────────────────────
 
     @classmethod
-    def from_file(cls, path: str, kernel_index: int = 0) -> "PTXAnalyzer":
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+    def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXAnalyzer":
+        import os
+        import subprocess
+
+        if path.endswith(".cu"):
+            out_ptx = path.replace(".cu", ".ptx")
+            cmd = ["nvcc", "-ptx", "-lineinfo", path, f"-arch={arch}", "-o", out_ptx]
+            print(f"Compilando CUDA para PTX: {' '.join(cmd)}")
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"Erro ao compilar {path}:\n{res.stderr}")
+            path_to_read = out_ptx
+        else:
+            path_to_read = path
+
+        with open(path_to_read, "r", encoding="utf-8", errors="replace") as f:
             return cls(f.read(), kernel_index)
 
     @classmethod

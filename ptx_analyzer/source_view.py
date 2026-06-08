@@ -89,7 +89,7 @@ class PTXSourceView:
     def from_files(cls, cu_path: str, ptx_path: str,
                    kernel_index: int = 0) -> "PTXSourceView":
         """
-        Carrega o .cu e o .ptx (gerado com -lineinfo) e retorna uma PTXSourceView.
+        Carrega o .cu e o .ptx e retorna uma PTXSourceView.
         """
         with open(cu_path,  "r", encoding="utf-8", errors="replace") as f:
             cu = f.read()
@@ -100,6 +100,26 @@ class PTXSourceView:
             raise ValueError("Nenhum kernel encontrado no PTX.")
         idx = min(kernel_index, len(kernels) - 1)
         return cls(cu, kernels[idx])
+
+    @classmethod
+    def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXSourceView":
+        """
+        Recebe um arquivo .cu, compila com -lineinfo automaticamente e abre a vista.
+        """
+        import os
+        import subprocess
+
+        if not path.endswith(".cu"):
+            raise ValueError("from_file() na PTXSourceView exige um arquivo .cu")
+        
+        out_ptx = path.replace(".cu", ".ptx")
+        cmd = ["nvcc", "-ptx", "-lineinfo", path, f"-arch={arch}", "-o", out_ptx]
+        print(f"Compilando CUDA para PTX (com -lineinfo): {' '.join(cmd)}")
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Erro ao compilar {path}:\n{res.stderr}")
+        
+        return cls.from_files(path, out_ptx, kernel_index)
 
     @classmethod
     def from_analyzer(cls, cu_path: str,
