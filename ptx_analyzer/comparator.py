@@ -3,7 +3,7 @@ Classe PTXComparator para comparar múltiplos kernels.
 """
 
 from typing import Dict, List
-from .analyzer import PTXAnalyzer
+from .analyzer import PTXAnalyzer, _bar, _section
 from .visuals import plot_instruction_mix_stacked, plot_memory_access_breakdown, plot_roofline
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -14,13 +14,16 @@ class PTXComparator:
     """
     Compara múltiplos kernels PTX lado a lado.
 
-    Uso:
-        comp = PTXComparator()
-        comp.add("bubble", PTXAnalyzer.from_file("bubble.ptx"))
-        comp.add("radix",  PTXAnalyzer.from_file("radix.ptx"))
-        comp.show_table()
-        comp.plot_comparison("Instruções", "Branches", "ld.global")
-        comp.plot_radar()
+    Saída em texto (sem dependências de UI):
+        comp.summary()                        # tabela comparativa + destaques ASCII
+        comp.generate_report_table()          # tabela Markdown para relatórios
+
+    Visualizações gráficas (requerem plotly/Jupyter):
+        comp.show_table()                     # tabela HTML com heat-map
+        comp.plot_comparison("Instruções")    # bar chart agrupado
+        comp.plot_radar()                     # radar chart normalizado
+        comp.plot_mix()                       # stacked bar do mix de instruções
+        comp.plot_roofline()                  # Roofline multi-kernel
     """
 
     def __init__(self):
@@ -106,6 +109,108 @@ class PTXComparator:
             '</table></div>'
         )
         display(w.HTML(value=html))
+
+    def summary(self):
+        """
+        Resumo comparativo em texto para todos os kernels adicionados.
+        Mostra tabela de métricas (linhas = métricas, colunas = kernels)
+        e destaques de desempenho — sem Jupyter nem plotly.
+        """
+        if not self._order:
+            print("Nenhum kernel adicionado.")
+            return
+
+        table = self._metrics()
+        names = self._order
+        metric_names = list(next(iter(table.values())).keys())
+
+        W = 60
+        print("╔" + "═" * W + "╗")
+        print(f"║  {'Comparação PTX — ' + str(len(names)) + ' kernel(s)':<{W - 2}}║")
+        print("╚" + "═" * W + "╝")
+
+        # Largura de cada coluna de kernel (mínimo 10, máximo 14)
+        col_w = min(14, max(10, max(len(n) for n in names) + 1))
+        metric_w = 18
+
+        # ── Cabeçalho da tabela
+        print()
+        header = f"  {'Métrica':<{metric_w}}"
+        for n in names:
+            header += f"  {n[:col_w]:>{col_w}}"
+        print(header)
+        print("  " + "─" * (metric_w + (col_w + 2) * len(names)))
+
+        # ── Linhas de métricas
+        for m in metric_names:
+            vals = [table[n].get(m, "—") for n in names]
+            # destaca o melhor valor em métricas relevantes
+            row = f"  {m:<{metric_w}}"
+            for v in vals:
+                row += f"  {str(v):>{col_w}}"
+            print(row)
+
+        # ── Destaques de desempenho
+        print(f"\n{_section('Destaques', W + 2)}")
+
+        def _best(metric: str, lower_is_better: bool = True) -> tuple:
+            vals = {n: float(table[n].get(metric, 0)) for n in names}
+            fn = min if lower_is_better else max
+            best = fn(vals, key=lambda x: vals[x])
+            return best, vals[best]
+
+        # Menos instruções → menor overhead geral
+        k_instr, v_instr = _best("Instruções")
+        print(f"  ↓ Menos instruções     : {k_instr:<{col_w}}  ({int(v_instr)})")
+
+        # Menor branch ratio → menos divergência de warp
+        k_br, v_br = _best("BranchRatio")
+        print(f"  ↓ Menor branch ratio   : {k_br:<{col_w}}  ({v_br:.1%})")
+
+        # Maior intensidade aritmética → mais compute-bound
+        k_ai, v_ai = _best("Int.Aritmética", lower_is_better=False)
+        print(f"  ↑ Maior int. aritmética: {k_ai:<{col_w}}  ({v_ai})")
+
+        # Mais uso de shared memory → melhor reutilização de dados
+        k_sh, v_sh = _best("Shared", lower_is_better=False)
+        if v_sh > 0:
+            print(f"  ↑ Mais shared memory   : {k_sh:<{col_w}}  ({int(v_sh)} acessos)")
+
+        # Sem local spill → sem overflow de registradores
+        no_spill = [n for n in names if float(table[n].get("ld/st.local", 0)) == 0]
+        if no_spill == names:
+            print(f"  ✅ Sem local spill em todos os kernels")
+        elif no_spill:
+            print(f"  ✅ Sem local spill     : {', '.join(no_spill)}")
+        else:
+            k_sp, v_sp = _best("ld/st.local")
+            print(f"  ⚠️  Todos com spill — menor: {k_sp} ({int(v_sp)})")
+
+        # Kernel 100% em registradores
+        reg_only = [n for n in names if float(table[n].get("SóRegistros", 0)) == 1]
+        if reg_only:
+            print(f"  ✅ 100% em registros   : {', '.join(reg_only)}")
+
+        # Mix bar chart por categoria (texto)
+        print(f"\n{_section('Mix de Instruções por Kernel', W + 2)}")
+        all_cats = sorted({
+            cat
+            for n in names
+            for cat in self._analyzers[n].kernel.category_counts
+        })
+        cat_w = max((len(c) for c in all_cats), default=10)
+        for cat in all_cats:
+            row = f"  {cat:<{cat_w}}"
+            for n in names:
+                k = self._analyzers[n].kernel
+                total = max(k.total_instructions, 1)
+                pct = k.category_counts.get(cat, 0) / total * 100
+                bar = _bar(k.category_counts.get(cat, 0),
+                           max(k.category_counts.values(), default=1), 14)
+                row += f"  {pct:4.1f}% {bar}"
+            print(row)
+
+        print()
 
     def _print_table(self):
         table = self._metrics()

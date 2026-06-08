@@ -3,9 +3,26 @@ Classe principal PTXAnalyzer.
 """
 
 import json
+from collections import Counter
 from .core import PTXKernel, CATEGORIES
 from .parser import parse_ptx
 from .heuristics import run_heuristics, LEVEL_ICONS
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers de saída em texto
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _bar(n: int, max_n: int, width: int = 32) -> str:
+    """Barra ASCII proporcional (█ preenchido, ░ vazio)."""
+    if max_n == 0:
+        return "░" * width
+    filled = round(n / max_n * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _section(title: str, total_w: int = 60) -> str:
+    rest = total_w - len(title) - 4
+    return f"── {title} {'─' * max(0, rest)}"
 from .visuals import (
     plot_category_pie, plot_category_bar, plot_instruction_timeline,
     plot_register_types, plot_instruction_mix_stacked, plot_memory_access_breakdown,
@@ -24,12 +41,23 @@ class PTXAnalyzer:
     """
     Interface principal de análise de um kernel PTX.
 
-    Uso:
-        a = PTXAnalyzer.from_file("kernel.ptx")
-        a.show()                    # interface ipywidgets com 4 abas
-        a.plot_distribution()       # pie chart
-        a.show_stats()              # métricas no terminal
-        a.to_dict()                 # exportar como dict
+    Saída em texto (sem dependências de UI):
+        a.summary()              # resumo completo: métricas, mix, memória, diagnóstico
+        a.show_stats()           # tabela de métricas com barras ASCII
+        a.show_warnings()        # diagnósticos heurísticos
+        a.show_top_opcodes(n)    # top-N opcodes mais frequentes
+        a.show_roofline_text()   # posição no modelo Roofline (ASCII)
+
+    Visualizações gráficas (requerem plotly/Jupyter):
+        a.show()                 # interface ipywidgets com 4 abas
+        a.plot_distribution()    # pie chart
+        a.plot_categories()      # bar chart por categoria
+        a.plot_timeline()        # sequência de instruções
+        a.plot_roofline()        # modelo Roofline interativo
+
+    Exportação:
+        a.to_dict()              # dict com todas as métricas
+        a.to_json()              # JSON string
     """
 
     def __init__(self, code: str, kernel_index: int = 0):
@@ -101,6 +129,152 @@ class PTXAnalyzer:
         for level, msg in run_heuristics(self.kernel):
             icon = LEVEL_ICONS.get(level, "•")
             print(f"  {icon}  {msg}")
+
+    def summary(self):
+        """
+        Resumo completo em texto: métricas, mix de instruções, memória e diagnóstico.
+        Equivalente text-only ao show() interativo — não requer Jupyter nem plotly.
+        """
+        k = self.kernel
+        W = 58
+
+        title = f"PTX Kernel: {k.name}  ({k.param_count} parâm.)"
+        print("╔" + "═" * W + "╗")
+        print(f"║  {title:<{W - 2}}║")
+        print("╚" + "═" * W + "╝")
+
+        # ── Métricas em 2 colunas
+        print(f"\n{_section('Métricas', W + 2)}")
+        pairs = [
+            ("Instruções totais",    k.total_instructions,
+             "Registradores",        k.total_registers),
+            ("ld.global",            k.global_loads,
+             "st.global",            k.global_stores),
+            ("ld/st.local (spill)",  k.local_accesses,
+             "Shared memory",        k.shared_accesses),
+            ("Branches pred.",       k.predicated_branches,
+             "Branch ratio",         f"{k.branch_ratio:.1%}"),
+            ("FMA",                  k.fma_count,
+             "shfl.sync",            k.shfl_count),
+            ("Int. aritmética",      k.arithmetic_intensity,
+             "Só registros",         "Sim" if k.is_register_only else "Não"),
+        ]
+        for l1, v1, l2, v2 in pairs:
+            print(f"  {l1:<22}: {str(v1):>6}    {l2:<18}: {str(v2):>6}")
+
+        # ── Mix de instruções com barras
+        print(f"\n{_section('Mix de Instruções', W + 2)}")
+        mix = sorted(k.category_counts.items(), key=lambda x: -x[1])
+        max_c = max((n for _, n in mix), default=1)
+        total = max(k.total_instructions, 1)
+        for cat, n in mix:
+            pct = n / total * 100
+            bar = _bar(n, max_c, 32)
+            print(f"  {cat:<14} {pct:5.1f}%  {bar}  {n:>4}")
+
+        # ── Breakdown de memória
+        print(f"\n{_section('Memória', W + 2)}")
+        mem_items = [
+            ("Global loads",  k.global_loads),
+            ("Global stores", k.global_stores),
+            ("Shared",        k.shared_accesses),
+            ("Local (spill)", k.local_accesses),
+        ]
+        max_mem = max((v for _, v in mem_items), default=1)
+        for label, n in mem_items:
+            bar = _bar(n, max_mem, 30)
+            print(f"  {label:<16}: {n:>5}  {bar}")
+
+        # ── Diagnósticos heurísticos
+        print(f"\n{_section('Diagnóstico', W + 2)}")
+        for level, msg in run_heuristics(k):
+            icon = LEVEL_ICONS.get(level, "•")
+            print(f"  {icon}  {msg}")
+        print()
+
+    def show_top_opcodes(self, n: int = 10):
+        """
+        Imprime os N opcodes mais frequentes do kernel com barra ASCII.
+        Útil para identificar os hotspots de instrução sem abrir um gráfico.
+        """
+        k = self.kernel
+        counts = Counter(i.op for i in k.instructions)
+        top = counts.most_common(n)
+        total = max(k.total_instructions, 1)
+        max_c = top[0][1] if top else 1
+        pad = max((len(op) for op, _ in top), default=20)
+        pad = max(pad, 20)
+
+        print(f"\n{_section(f'Top {n} Opcodes — {k.name}', 60)}")
+        print(f"  {'#':>3}  {'Opcode':<{pad}}  {'Qtd':>5}  {'%':>5}  Barra")
+        print(f"  {'─'*3}  {'─'*pad}  {'─'*5}  {'─'*5}  {'─'*26}")
+        for rank, (op, count) in enumerate(top, 1):
+            pct = count / total * 100
+            bar = _bar(count, max_c, 26)
+            print(f"  {rank:>3}  {op:<{pad}}  {count:>5}  {pct:5.1f}%  {bar}")
+        print()
+
+    def show_roofline_text(self, peak_flops: float = 15.7, peak_bw: float = 900.0):
+        """
+        Posição estimada do kernel no modelo Roofline (análise estática).
+        A escala usa arith_instrs/mem_instrs como proxy — não FLOPs/Byte reais.
+        Para análise precisa, use nvprof / Nsight Compute.
+        """
+        k = self.kernel
+        ai = k.arithmetic_intensity
+
+        if ai < 1.0:
+            classif, icon = "MEMORY-BOUND", "⚠️ "
+        elif ai < 2.0:
+            classif, icon = "LIMÍTROFE", "ℹ️ "
+        else:
+            classif, icon = "COMPUTE-BOUND", "✅"
+
+        W = 58
+        print(f"\n{_section('Roofline — estimativa estática', W + 2)}")
+        print(f"  Hardware (padrão):  {peak_flops} TFLOP/s  |  {peak_bw} GB/s BW")
+        print(f"\n  Kernel: {k.name}")
+        print(f"    Int. aritmética  : {ai}  (arith_instrs / mem_instrs)")
+        print(f"    Classificação    : {icon}  {classif}")
+        print()
+
+        # Escala 0..4+, barras de 36 chars
+        bar_w = 36
+        scale_max = 4.0
+        pos = min(int(ai / scale_max * bar_w), bar_w - 1)
+        p1 = int(1.0 / scale_max * bar_w)   # = 9
+        p2 = int(2.0 / scale_max * bar_w)   # = 18
+
+        line = list("─" * bar_w)
+        for p in [p1, p2]:
+            line[p] = "┼"
+        line[pos] = "╪" if line[pos] == "┼" else "▲"
+        line_str = "".join(line)
+
+        prefix = "  [MEMÓRIA] "
+        print(f"{prefix}{line_str} [CÁLCULO]")
+
+        # Label numérica alinhada com os ticks
+        label = (
+            "0.0"
+            + " " * (p1 - 3)
+            + "1.0"
+            + " " * (p2 - p1 - 3)
+            + "2.0"
+            + " " * (p1 - 3)
+            + "3.0"
+            + " " * (p1 - 3)
+            + "4.0+"
+        )
+        print(" " * len(prefix) + label)
+
+        # Anotação de regiões
+        annot = " " * p1 + "└memory " + " " * (p2 - p1 - 8) + "└compute"
+        print(" " * len(prefix) + annot)
+        print()
+        print(f"  Nota: escala em (arith_instrs / mem_instrs), não FLOPs/Byte.")
+        print(f"        Para análise precisa use nvprof / Nsight Compute.")
+        print()
 
     def show_instructions(self, filter_cat: str = "all", search: str = ""):
         """Exibe tabela de instruções filtrada."""
