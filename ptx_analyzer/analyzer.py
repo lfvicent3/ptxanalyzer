@@ -158,25 +158,58 @@ class PTXAnalyzer:
 
     def show_stats(self):
         """Imprime métricas resumidas no terminal/célula."""
-        k = self.kernel
-        print(f"\n{'='*56}")
-        print(f"  Kernel: {k.name}")
-        print(f"{'='*56}")
-        print(f"  Total de instruções : {k.total_instructions}")
-        print(f"  Total de registros  : {k.total_registers}")
-        print(f"  ld.global           : {k.global_loads}")
-        print(f"  st.global           : {k.global_stores}")
-        print(f"  Shared memory       : {k.shared_accesses}")
-        print(f"  Branches predicados : {k.predicated_branches}")
-        print(f"  Operações atômicas  : {k.atomics}")
-        print(f"  FMA                 : {k.fma_count}")
-        print(f"  shfl.sync           : {k.shfl_count}")
-        print(f"  Int. aritmética     : {k.arithmetic_intensity}")
-        print(f"\n  Contagem por categoria:")
-        for cat, n in sorted(k.category_counts.items(), key=lambda x: -x[1]):
-            bar = "█" * min(n, 40)
-            print(f"    {cat:<14} {n:>5}  {bar}")
-        print()
+        import io, sys as _sys
+        _buf = io.StringIO()
+        _real = _sys.stdout
+        _sys.stdout = _buf
+        try:
+            k = self.kernel
+            W = 56
+            print(f"\n{'═'*W}")
+            print(f"  Kernel: {k.name}")
+            print(f"{'═'*W}")
+            print(f"  Total de instruções  : {k.total_instructions}")
+            print(f"  Total de registros   : {k.total_registers}")
+            print(f"{'─'*W}")
+            print(f"  Branches total       : {k.total_branches}")
+            print(f"  Cond. (@%p bra)      : {k.predicated_branches}"
+                  "  ← divergência possível")
+            print(f"  Incond. (bra.uni)    : {k.unconditional_branches}"
+                  "  ← sem divergência")
+            print(f"  setp (comparações)   : {k.setp_count}")
+            print(f"  Branch ratio         : {k.branch_ratio:.1%}")
+            print(f"{'─'*W}")
+            print(f"  ld.global            : {k.global_loads}")
+            print(f"  st.global            : {k.global_stores}")
+            print(f"  Shared memory        : {k.shared_accesses}")
+            print(f"  Local (spill)        : {k.local_accesses}")
+            print(f"{'─'*W}")
+            print(f"  Operações atômicas   : {k.atomics}")
+            print(f"  FMA                  : {k.fma_count}")
+            print(f"  shfl.sync            : {k.shfl_count}")
+            print(f"  Int. aritmética      : {k.arithmetic_intensity:.3f}")
+            print(f"\n  Contagem por categoria:")
+            for cat, n in sorted(k.category_counts.items(), key=lambda x: -x[1]):
+                bar = "█" * min(n, 38)
+                print(f"    {cat:<14} {n:>5}  {bar}")
+            print()
+        finally:
+            _sys.stdout = _real
+            _text = _buf.getvalue()
+            try:
+                import html as _html
+                from IPython.display import display as _ipy_display
+                import ipywidgets as _w
+                _ipy_display(_w.HTML(
+                    '<pre style="background:#0f1416;color:#e8eaed;'
+                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
+                    'padding:14px;border-radius:8px;font-size:13px;'
+                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
+                    + _html.escape(_text)
+                    + '</pre>'
+                ))
+            except Exception:
+                print(_text, end='')
 
     def show_warnings(self):
         """Imprime diagnósticos no terminal."""
