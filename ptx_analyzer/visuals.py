@@ -3,7 +3,7 @@ Visualizações com Plotly para análise PTX.
 """
 
 from typing import Dict
-from .core import PTXKernel, CATEGORIES, CATEGORY_COLORS
+from .core import PTXKernel, CATEGORIES, CATEGORY_COLORS, build_cfg
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Visualizações (Plotly)
@@ -240,6 +240,239 @@ def plot_roofline(kernels: Dict[str, "PTXKernel"],
                    type="log", gridcolor="#1e293b"),
         yaxis=dict(title="Performance Estimada (GFLOPs/s)",
                    type="log", gridcolor="#1e293b"),
+        **_DARK_LAYOUT,
+    )
+    return fig
+
+
+def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
+    """
+    Grafo de Fluxo de Controle (CFG) interativo.
+
+    Cada nó representa um bloco básico (sequência de instruções sem desvio interno).
+    As arestas mostram para onde cada branch leva:
+      • Laranja  — desvio condicional (@%p bra) → divergência de warp possível
+      • Azul     — salto incondicional (bra.uni) → sem divergência
+      • Cinza    — fall-through (execução sequencial)
+
+    Verde = bloco de entrada  |  Vermelho = bloco de saída (ret/exit)
+
+    Args:
+        max_blocks: número máximo de blocos exibidos (BFS a partir da entrada).
+    """
+    import plotly.graph_objects as go
+    from collections import deque
+
+    blocks, order = build_cfg(kernel)
+    if not blocks:
+        print("Nenhum bloco básico encontrado.")
+        return
+
+    # ── BFS para definir nível (linha y) e coluna (x) de cada bloco ──────────
+    entry = order[0]
+    level_of: Dict[str, int] = {entry: 0}
+    col_counter: Dict[int, int] = {}
+    col_of: Dict[str, int] = {}
+    bfs_order = []
+    visited = set()
+    queue = deque([entry])
+
+    while queue and len(bfs_order) < max_blocks:
+        lbl = queue.popleft()
+        if lbl in visited or lbl not in blocks:
+            continue
+        visited.add(lbl)
+        bfs_order.append(lbl)
+        lv = level_of.get(lbl, 0)
+        col_counter.setdefault(lv, 0)
+        col_of[lbl] = col_counter[lv]
+        col_counter[lv] += 1
+        for _, target in blocks[lbl].exits:
+            if target in blocks and target not in visited:
+                level_of.setdefault(target, lv + 1)
+                queue.append(target)
+
+    visible = set(bfs_order)
+
+    # ── Posições dos nós ──────────────────────────────────────────────────────
+    X_STEP = 240
+    Y_STEP = 130
+    NODE_W = 210
+    NODE_H = 55
+
+    def _pos(lbl):
+        lv = level_of.get(lbl, 0)
+        col = col_of.get(lbl, 0)
+        n_cols = col_counter.get(lv, 1)
+        x = (col - (n_cols - 1) / 2) * X_STEP
+        y = -lv * Y_STEP
+        return x, y
+
+    fig = go.Figure()
+
+    # ── Arestas ───────────────────────────────────────────────────────────────
+    EDGE_COLOR = {"conditional": "#f59e0b", "jump": "#3b82f6", "fallthrough": "#6b7280"}
+
+    for lbl in bfs_order:
+        block = blocks[lbl]
+        x0, y0 = _pos(lbl)
+        for etype, target in block.exits:
+            if target not in visible:
+                continue
+            x1, y1 = _pos(target)
+            color = EDGE_COLOR.get(etype, "#6b7280")
+            # Linha da aresta
+            fig.add_trace(go.Scatter(
+                x=[x0, x1, None], y=[y0 - NODE_H / 2, y1 + NODE_H / 2, None],
+                mode="lines",
+                line=dict(color=color, width=1.8),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            # Cabeça de seta via annotation
+            fig.add_annotation(
+                x=x1, y=y1 + NODE_H / 2,
+                ax=x0, ay=y0 - NODE_H / 2,
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=2, arrowsize=1.2,
+                arrowwidth=1.8, arrowcolor=color, text="",
+            )
+
+    # ── Nós (retângulos + texto) ──────────────────────────────────────────────
+    NODE_FILL = {
+        "entry":    ("#065f46", "#6ee7b7"),  # verde
+        "terminal": ("#7f1d1d", "#fca5a5"),  # vermelho
+        "branch":   ("#78350f", "#fcd34d"),  # amarelo/laranja
+        "normal":   ("#1e293b", "#475569"),  # azul escuro
+    }
+
+    for lbl in bfs_order:
+        block = blocks[lbl]
+        x, y = _pos(lbl)
+        n = len(block.instructions)
+        last_raw = block.instructions[-1].raw if block.instructions else ""
+
+        if block.is_entry:
+            fk = "entry"
+        elif block.is_terminal:
+            fk = "terminal"
+        elif any(e == "conditional" for e, _ in block.exits):
+            fk = "branch"
+        else:
+            fk = "normal"
+
+        fill, border = NODE_FILL[fk]
+
+        fig.add_shape(
+            type="rect",
+            x0=x - NODE_W / 2, x1=x + NODE_W / 2,
+            y0=y - NODE_H / 2, y1=y + NODE_H / 2,
+            fillcolor=fill,
+            line=dict(color=border, width=1.5),
+        )
+
+        display_lbl = lbl.replace("__ENTRY__", "ENTRY")
+        label_text = (
+            f"<b>{display_lbl}</b><br>"
+            f"<span style='font-size:10px;color:#94a3b8'>{n} instr</span>"
+        )
+        fig.add_annotation(
+            x=x, y=y, text=label_text,
+            showarrow=False,
+            font=dict(size=11, color="#f1f5f9"),
+            xref="x", yref="y",
+            align="center",
+        )
+
+        # Ponto invisível para hover com detalhes
+        import os as _os
+        last_instr = block.instructions[-1] if block.instructions else None
+        exits_str = ", ".join(f"{t}→{tgt}" for t, tgt in block.exits[:3]) or "—"
+
+        # Encontra setp que gera o predicado do branch final
+        def _find_setp_hover(instrs):
+            if not instrs:
+                return None
+            bra = instrs[-1]
+            if bra.op_base != "bra" or not bra.is_predicated or not bra.predicate:
+                return None
+            pred_reg = bra.predicate.lstrip("@").lstrip("!")
+            for ins in reversed(instrs[:-1]):
+                if ins.op_base == "setp" and ins.operands and ins.operands[0] == pred_reg:
+                    return ins
+            return None
+
+        def _loc_hover(instr):
+            tag = f"PTX:{instr.line_no}"
+            if instr.source_line > 0:
+                fname = _os.path.basename(kernel.file_map.get(instr.source_file, ""))
+                tag += f" / {fname}:{instr.source_line}" if fname else f" / src:{instr.source_line}"
+            return tag
+
+        setp_instr = _find_setp_hover(block.instructions)
+        branch_detail = ""
+        if setp_instr:
+            branch_detail += f"<br>setp: {setp_instr.raw.strip()[:55]}<br>  {_loc_hover(setp_instr)}"
+        if last_instr and last_instr.op_base in ("bra", "brx"):
+            branch_detail += f"<br>bra:  {last_instr.raw.strip()[:55]}<br>  {_loc_hover(last_instr)}"
+        elif last_instr and last_instr.op_base in ("ret", "exit"):
+            branch_detail += f"<br>{last_instr.op_base}  {_loc_hover(last_instr)}"
+
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode="markers",
+            marker=dict(size=NODE_W * 0.9, opacity=0, symbol="square"),
+            hovertemplate=(
+                f"<b>{display_lbl}</b><br>"
+                f"Instruções: {n}<br>"
+                f"Saídas: {exits_str}"
+                f"{branch_detail}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    # ── Legenda manual ────────────────────────────────────────────────────────
+    for color, name in [
+        ("#f59e0b", "Desvio condicional (@%p bra)"),
+        ("#3b82f6", "Salto incondicional (bra.uni)"),
+        ("#6b7280", "Fall-through"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(color=color, width=2), name=name, showlegend=True,
+        ))
+    for color, name in [
+        ("#6ee7b7", "Entrada"), ("#fca5a5", "Saída (ret/exit)"),
+        ("#fcd34d", "Branch condicional"), ("#475569", "Bloco normal"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(color=color, size=10, symbol="square"),
+            name=name, showlegend=True,
+        ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    if bfs_order:
+        all_x = [_pos(l)[0] for l in bfs_order]
+        all_y = [_pos(l)[1] for l in bfs_order]
+        xmarg = NODE_W
+        ymarg = NODE_H * 2
+        xr = [min(all_x) - xmarg, max(all_x) + xmarg]
+        yr = [min(all_y) - ymarg, max(all_y) + ymarg]
+    else:
+        xr = [-200, 200]
+        yr = [-200, 50]
+
+    truncated = len(blocks) > max_blocks
+    title = f"CFG — {kernel.name}"
+    if truncated:
+        title += f"  (primeiros {max_blocks} de {len(blocks)} blocos)"
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(visible=False, range=xr),
+        yaxis=dict(visible=False, range=yr, scaleanchor="x", scaleratio=1),
+        legend=dict(orientation="h", y=-0.05, font=dict(size=11)),
+        height=max(500, level_of.get(bfs_order[-1], 0) * Y_STEP + 250) if bfs_order else 500,
         **_DARK_LAYOUT,
     )
     return fig

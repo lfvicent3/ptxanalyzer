@@ -23,10 +23,11 @@ def _bar(n: int, max_n: int, width: int = 32) -> str:
 def _section(title: str, total_w: int = 60) -> str:
     rest = total_w - len(title) - 4
     return f"── {title} {'─' * max(0, rest)}"
+from .core import build_cfg
 from .visuals import (
     plot_category_pie, plot_category_bar, plot_instruction_timeline,
     plot_register_types, plot_instruction_mix_stacked, plot_memory_access_breakdown,
-    plot_roofline
+    plot_roofline, plot_branch_cfg as _plot_branch_cfg,
 )
 from .html_render import (
     _render_overview_html, _render_instructions_html,
@@ -47,6 +48,7 @@ class PTXAnalyzer:
         a.show_warnings()        # diagnósticos heurísticos
         a.show_top_opcodes(n)    # top-N opcodes mais frequentes
         a.show_roofline_text()   # posição no modelo Roofline (ASCII)
+        a.show_branch_tree()     # árvore de desvios (CFG em ASCII)
 
     Visualizações gráficas (requerem plotly/Jupyter):
         a.show()                 # interface ipywidgets com 4 abas
@@ -54,6 +56,7 @@ class PTXAnalyzer:
         a.plot_categories()      # bar chart por categoria
         a.plot_timeline()        # sequência de instruções
         a.plot_roofline()        # modelo Roofline interativo
+        a.plot_branch_cfg()      # grafo de fluxo de controle (CFG)
 
     Exportação:
         a.to_dict()              # dict com todas as métricas
@@ -79,16 +82,30 @@ class PTXAnalyzer:
 
     @classmethod
     def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXAnalyzer":
-        import os
         import subprocess
 
         if path.endswith(".cu"):
             out_ptx = path.replace(".cu", ".ptx")
-            cmd = ["nvcc", "-ptx", "-lineinfo", path, f"-arch={arch}", "-o", out_ptx]
+            # --ptxas-options=-v → ptxas imprime registradores, smem e spill no stderr
+            cmd = [
+                "nvcc", "-ptx", "-lineinfo",
+                "--ptxas-options=-v",
+                path, f"-arch={arch}", "-o", out_ptx,
+            ]
             print(f"Compilando CUDA para PTX: {' '.join(cmd)}")
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode != 0:
                 raise RuntimeError(f"Erro ao compilar {path}:\n{res.stderr}")
+
+            # Exibir info do ptxas (vai para stderr mesmo com sucesso)
+            ptxas_info = [ln for ln in res.stderr.splitlines()
+                          if ln.strip().startswith("ptxas")]
+            if ptxas_info:
+                print("\n── Informações ptxas (--ptxas-options=-v) ──")
+                for ln in ptxas_info:
+                    print(" ", ln)
+                print()
+
             path_to_read = out_ptx
         else:
             path_to_read = path
@@ -166,8 +183,12 @@ class PTXAnalyzer:
              "st.global",            k.global_stores),
             ("ld/st.local (spill)",  k.local_accesses,
              "Shared memory",        k.shared_accesses),
-            ("Branches pred.",       k.predicated_branches,
+            ("Branches total",       k.total_branches,
              "Branch ratio",         f"{k.branch_ratio:.1%}"),
+            ("Cond. (@%p bra)",      k.predicated_branches,
+             "Incond. (.uni)",        k.unconditional_branches),
+            ("setp (predicados)",    k.setp_count,
+             "Blocos básicos",       len(build_cfg(k)[1])),
             ("FMA",                  k.fma_count,
              "shfl.sync",            k.shfl_count),
             ("Int. aritmética",      k.arithmetic_intensity,
@@ -426,6 +447,203 @@ class PTXAnalyzer:
             tabs.set_title(idx, title)
 
         display(tabs)
+
+    # ── branches / CFG ──────────────────────────────────────────────────────
+
+    def show_branch_tree(self):
+        """
+        Imprime a árvore de desvios do kernel em texto.
+
+        Para cada bloco básico mostra o par (setp + bra) que causa o desvio
+        e, quando o PTX foi compilado com -lineinfo, exibe o trecho do
+        código-fonte .cu correspondente a cada branch.
+
+        Legenda de tipos de aresta:
+          →[cond]  desvio condicional (@%p bra) — pode causar divergência de warp
+          →[jump]  salto incondicional (bra.uni)
+          →[fall]  fall-through (execução sequencial)
+        """
+        import os
+
+        k = self.kernel
+        blocks, order = build_cfg(k)
+        W = 64
+
+        # ── carrega arquivos-fonte referenciados pelo PTX ─────────────────────
+        src_cache: dict = {}   # file_idx → lista de linhas (ou None se ausente)
+        for fidx, fpath in k.file_map.items():
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as fh:
+                    src_cache[fidx] = fh.readlines()
+            except OSError:
+                src_cache[fidx] = None
+
+        def _src_line(instr):
+            """Retorna o conteúdo da linha .cu correspondente à instrução, ou None."""
+            if instr.source_line <= 0:
+                return None
+            lines = src_cache.get(instr.source_file)
+            if lines is None:
+                return None
+            idx = instr.source_line - 1
+            if 0 <= idx < len(lines):
+                return lines[idx].rstrip()
+            return None
+
+        # ── helpers ──────────────────────────────────────────────────────────
+
+        def _find_setp(instrs, bra_idx):
+            bra = instrs[bra_idx]
+            if not bra.is_predicated or not bra.predicate:
+                return None
+            pred_reg = bra.predicate.lstrip("@").lstrip("!")
+            for i in range(bra_idx - 1, -1, -1):
+                ins = instrs[i]
+                if ins.op_base == "setp" and ins.operands and ins.operands[0] == pred_reg:
+                    return ins
+            return None
+
+        def _ptx_loc(instr):
+            fname = os.path.basename(k.file_map.get(instr.source_file, ""))
+            if instr.source_line > 0 and fname:
+                return f"PTX:{instr.line_no}  {fname}:{instr.source_line}"
+            return f"PTX:{instr.line_no}"
+
+        def _short(raw, width=46):
+            return raw.strip()[:width]
+
+        def _print_branch_detail(detail, instr, label):
+            """Imprime linha PTX + código-fonte correspondente."""
+            src = _src_line(instr)
+            loc = _ptx_loc(instr)
+            print(f"{detail}{label}  {_short(instr.raw):<46}  [{loc}]")
+            if src:
+                src_trimmed = src.strip()[:70]
+                print(f"{detail}       ╰─ {src_trimmed}")
+
+        # ── cabeçalho ────────────────────────────────────────────────────────
+
+        has_src = any(i.source_line > 0 for i in k.instructions)
+        has_src_files = any(v is not None for v in src_cache.values())
+
+        print(f"\n{'═'*W}")
+        print(f"  Árvore de Desvios — {k.name}")
+        print(f"{'═'*W}")
+        print(f"  Blocos básicos       : {len(blocks)}")
+        print(f"  Branches total       : {k.total_branches}")
+        print(f"  Condicionais (@%p)   : {k.predicated_branches}"
+              "  ← potencial divergência de warp")
+        print(f"  Incondicionais (.uni): {k.unconditional_branches}"
+              "  ← sem divergência")
+        print(f"  Instruções setp      : {k.setp_count}"
+              "  ← comparações que geram predicados")
+        print(f"  Branch ratio         : {k.branch_ratio:.1%}")
+        if not has_src:
+            print(f"  (sem mapeamento de fonte — compile com -lineinfo para ver código .cu)")
+        elif not has_src_files:
+            print(f"  (arquivos .cu não encontrados nos caminhos do file_map)")
+        print(f"{'─'*W}")
+
+        EDGE_ICONS = {
+            "conditional": "→[cond] ",
+            "jump":        "→[jump] ",
+            "fallthrough": "→[fall] ",
+        }
+
+        # ── DFS ──────────────────────────────────────────────────────────────
+        visited: set = set()
+        stack = [(order[0], 0)] if order else []
+
+        while stack:
+            lbl, depth = stack.pop()
+            if lbl not in blocks:
+                continue
+
+            block = blocks[lbl]
+            display = lbl.replace("__ENTRY__", "ENTRY")
+            n = len(block.instructions)
+
+            if block.is_entry:
+                tag = "[ENTRADA]"
+            elif block.is_terminal:
+                tag = "[SAÍDA]  "
+            elif any(e == "conditional" for e, _ in block.exits):
+                tag = "[BRANCH] "
+            else:
+                tag = "         "
+
+            prefix = "  " + "│  " * depth
+            connector = "└─" if depth else "  "
+            already = " (já visitado)" if lbl in visited else ""
+            print(f"{prefix}{connector}{tag} {display}  ({n} instrs){already}")
+
+            if lbl in visited:
+                continue
+            visited.add(lbl)
+
+            # Detalhe do branch terminador do bloco
+            detail = "  " + "   " * depth + "     "
+            last = block.instructions[-1] if block.instructions else None
+
+            if last and last.op_base == "bra":
+                bra_idx = len(block.instructions) - 1
+                if last.is_predicated:
+                    setp = _find_setp(block.instructions, bra_idx)
+                    if setp:
+                        # Mostrar setp com sua linha de código-fonte
+                        _print_branch_detail(detail, setp, "setp ")
+                    # Mostrar bra — só repetir o código-fonte se for linha diferente do setp
+                    bra_src = _src_line(last)
+                    setp_src = _src_line(setp) if setp else None
+                    if bra_src and bra_src != setp_src:
+                        _print_branch_detail(detail, last, "bra  ")
+                    else:
+                        loc = _ptx_loc(last)
+                        print(f"{detail}bra    {_short(last.raw):<46}  [{loc}]")
+                else:
+                    _print_branch_detail(detail, last, "jump ")
+            elif last and last.op_base in ("ret", "exit", "brx"):
+                loc = _ptx_loc(last)
+                print(f"{detail}{last.op_base:<6} {'':<46}  [{loc}]")
+
+            # Arestas de saída
+            for etype, target in reversed(block.exits):
+                icon = EDGE_ICONS.get(etype, "→ ")
+                print(f"{detail}{icon}{target}")
+                if target not in visited:
+                    stack.append((target, depth + 1))
+
+        # Blocos com back-edges / não alcançados pelo DFS
+        unreachable = [l for l in order if l not in visited and l in blocks]
+        if unreachable:
+            print(f"\n  Blocos com back-edges / não alcançados pelo DFS ({len(unreachable)}):")
+            for lbl in unreachable[:12]:
+                b = blocks[lbl]
+                last = b.instructions[-1] if b.instructions else None
+                loc_str = f"  {_loc(last)}" if last else ""
+                exits_str = "  ".join(
+                    f"{EDGE_ICONS.get(e,'→')}{t}" for e, t in b.exits[:3]
+                )
+                print(f"    {lbl:<28} ({len(b.instructions):>3} instrs){loc_str}")
+                if exits_str:
+                    print(f"    {'':28}  {exits_str}")
+            if len(unreachable) > 12:
+                print(f"    ... e mais {len(unreachable) - 12} blocos")
+        print()
+
+    def plot_branch_cfg(self, max_blocks: int = 30):
+        """
+        Exibe o Grafo de Fluxo de Controle (CFG) interativo com Plotly.
+
+        Cada nó é um bloco básico; arestas mostram para onde cada branch leva.
+          Laranja = condicional (@%p bra)   → divergência de warp possível
+          Azul    = incondicional (bra.uni) → sem divergência
+          Cinza   = fall-through
+
+        Args:
+            max_blocks: número máximo de blocos mostrados (BFS a partir da entrada).
+        """
+        return _plot_branch_cfg(self.kernel, max_blocks)
 
     # ── exportação ───────────────────────────────────────────────────────────
 

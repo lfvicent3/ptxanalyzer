@@ -4,9 +4,9 @@ Taxonomia e modelo de dados básicos para a análise PTX.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Taxonomia de instruções PTX
@@ -82,6 +82,17 @@ class PTXInstruction:
 
 
 @dataclass
+class BasicBlock:
+    """Bloco básico do grafo de fluxo de controle (CFG)."""
+    label: str
+    instructions: List[PTXInstruction]
+    # (tipo_aresta, rótulo_destino): "conditional"|"jump"|"fallthrough"
+    exits: List[Tuple[str, str]] = field(default_factory=list)
+    is_entry: bool = False
+    is_terminal: bool = False   # ret/exit ou bra.uni sem fall-through
+
+
+@dataclass
 class PTXKernel:
     name: str
     instructions: List[PTXInstruction] = field(default_factory=list)
@@ -125,8 +136,25 @@ class PTXKernel:
 
     @property
     def predicated_branches(self) -> int:
+        """Branches condicionais (@%p bra) — causam divergência de warp."""
         return sum(1 for i in self.instructions
                    if i.op_base == "bra" and i.is_predicated)
+
+    @property
+    def total_branches(self) -> int:
+        """Todas as instruções bra/brx (condicionais + incondicionais)."""
+        return sum(1 for i in self.instructions if i.op_base in ("bra", "brx"))
+
+    @property
+    def unconditional_branches(self) -> int:
+        """Saltos incondicionais (bra.uni ou bra sem predicado) — sem divergência."""
+        return sum(1 for i in self.instructions
+                   if i.op_base == "bra" and not i.is_predicated)
+
+    @property
+    def setp_count(self) -> int:
+        """Instruções setp — cada uma define um predicado que pode levar a um branch."""
+        return sum(1 for i in self.instructions if i.op_base == "setp")
 
     @property
     def fma_count(self) -> int:
@@ -189,19 +217,105 @@ class PTXKernel:
 
     def metrics_dict(self) -> dict:
         return {
-            "Instruções":      self.total_instructions,
-            "Registradores":   self.total_registers,
-            "ld.global":       self.global_loads,
-            "st.global":       self.global_stores,
-            "ld/st.local":     self.local_accesses,
-            "Shared":          self.shared_accesses,
-            "Branches":        self.predicated_branches,
-            "BranchRatio":     self.branch_ratio,
-            "Atômicas":        self.atomics,
-            "FMA":             self.fma_count,
-            "min/max":         self.min_max_count,
-            "shfl.sync":       self.shfl_count,
-            "shl/shr":         self.bit_ops_count,
-            "SóRegistros":     int(self.is_register_only),
-            "Int.Aritmética":  self.arithmetic_intensity,
+            "Instruções":           self.total_instructions,
+            "Registradores":        self.total_registers,
+            "ld.global":            self.global_loads,
+            "st.global":            self.global_stores,
+            "ld/st.local":          self.local_accesses,
+            "Shared":               self.shared_accesses,
+            "BranchTotal":          self.total_branches,
+            "BranchCondicional":    self.predicated_branches,
+            "BranchIncondicional":  self.unconditional_branches,
+            "Setp":                 self.setp_count,
+            "BranchRatio":          self.branch_ratio,
+            "Atômicas":             self.atomics,
+            "FMA":                  self.fma_count,
+            "min/max":              self.min_max_count,
+            "shfl.sync":            self.shfl_count,
+            "shl/shr":              self.bit_ops_count,
+            "SóRegistros":          int(self.is_register_only),
+            "Int.Aritmética":       self.arithmetic_intensity,
         }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Grafo de Fluxo de Controle (CFG)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_TERMINATOR_OPS = {"ret", "exit", "brx"}
+
+
+def build_cfg(kernel: PTXKernel) -> Tuple[Dict[str, BasicBlock], List[str]]:
+    """
+    Constrói o CFG do kernel a partir de suas instruções.
+
+    Retorna (blocks, order):
+        blocks: dict rótulo → BasicBlock
+        order:  lista de rótulos na ordem de aparição no PTX
+    """
+    blocks: Dict[str, BasicBlock] = {}
+    order: List[str] = []
+    current_label = "__ENTRY__"
+    current_instrs: List[PTXInstruction] = []
+
+    def _flush():
+        nonlocal current_label, current_instrs
+        if not current_instrs:
+            return
+        if current_label not in blocks:
+            blocks[current_label] = BasicBlock(current_label, current_instrs[:], [])
+            order.append(current_label)
+        current_instrs = []
+
+    for instr in kernel.instructions:
+        # Nova label → novo bloco básico
+        if instr.label:
+            _flush()
+            current_label = instr.label
+
+        current_instrs.append(instr)
+
+        # Terminador de bloco (bra, ret, exit, brx)
+        if instr.op_base in ("bra", "brx", "ret", "exit"):
+            _flush()
+            # Bloco sequencial anônimo que começa após o branch
+            current_label = f"__seq_{len(blocks)}__"
+
+    _flush()
+
+    # Adicionar arestas
+    for i, lbl in enumerate(order):
+        block = blocks[lbl]
+        if not block.instructions:
+            continue
+        last = block.instructions[-1]
+
+        if last.op_base == "bra":
+            target = last.operands[-1] if last.operands else None
+            if last.is_predicated:
+                # Condicional: vai para target OU cai no próximo bloco
+                if target and target in blocks:
+                    block.exits.append(("conditional", target))
+                if i + 1 < len(order):
+                    block.exits.append(("fallthrough", order[i + 1]))
+            else:
+                # Incondicional (bra.uni): só vai para target
+                if target and target in blocks:
+                    block.exits.append(("jump", target))
+                block.is_terminal = True  # sem fall-through sequencial
+        elif last.op_base in _TERMINATOR_OPS:
+            block.is_terminal = True
+        else:
+            # Fall-through implícito
+            if i + 1 < len(order):
+                block.exits.append(("fallthrough", order[i + 1]))
+
+    # Marcar terminais sem saídas
+    for block in blocks.values():
+        if not block.exits:
+            block.is_terminal = True
+
+    if order:
+        blocks[order[0]].is_entry = True
+
+    return blocks, order
