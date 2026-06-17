@@ -27,7 +27,9 @@ from .core import build_cfg
 from .visuals import (
     plot_category_pie, plot_category_bar, plot_instruction_timeline,
     plot_register_types, plot_instruction_mix_stacked, plot_memory_access_breakdown,
-    plot_roofline, plot_branch_cfg as _plot_branch_cfg,
+    plot_roofline,
+    plot_branch_cfg as _plot_branch_cfg,
+    plot_decision_tree as _plot_decision_tree,
 )
 from .html_render import (
     _render_overview_html, _render_instructions_html,
@@ -484,7 +486,7 @@ class PTXAnalyzer:
           →[jump]  salto incondicional (bra.uni)
           →[fall]  fall-through (execução sequencial)
         """
-        import os
+        import os, io, sys as _sys
 
         k = self.kernel
         blocks, order = build_cfg(k)
@@ -546,6 +548,10 @@ class PTXAnalyzer:
 
         has_src = any(i.source_line > 0 for i in k.instructions)
         has_src_files = any(v is not None for v in src_cache.values())
+
+        _buf = io.StringIO()
+        _real_stdout = _sys.stdout
+        _sys.stdout = _buf
 
         print(f"\n{'═'*W}")
         print(f"  Árvore de Desvios — {k.name}")
@@ -641,7 +647,7 @@ class PTXAnalyzer:
             for lbl in unreachable[:12]:
                 b = blocks[lbl]
                 last = b.instructions[-1] if b.instructions else None
-                loc_str = f"  {_loc(last)}" if last else ""
+                loc_str = f"  {_ptx_loc(last)}" if last else ""
                 exits_str = "  ".join(
                     f"{EDGE_ICONS.get(e,'→')}{t}" for e, t in b.exits[:3]
                 )
@@ -651,6 +657,23 @@ class PTXAnalyzer:
             if len(unreachable) > 12:
                 print(f"    ... e mais {len(unreachable) - 12} blocos")
         print()
+
+        _sys.stdout = _real_stdout
+        _text = _buf.getvalue()
+        try:
+            import html as _html
+            from IPython.display import display as _ipy_display
+            import ipywidgets as _w
+            _ipy_display(_w.HTML(
+                '<pre style="background:#0f1416;color:#e8eaed;'
+                'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
+                'padding:14px;border-radius:8px;font-size:13px;'
+                'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
+                + _html.escape(_text)
+                + '</pre>'
+            ))
+        except Exception:
+            print(_text, end='')
 
     def plot_branch_cfg(self, max_blocks: int = 30):
         """
@@ -665,6 +688,22 @@ class PTXAnalyzer:
             max_blocks: número máximo de blocos mostrados (BFS a partir da entrada).
         """
         return _plot_branch_cfg(self.kernel, max_blocks)
+
+    def plot_decision_tree(self, max_decisions: int = 20):
+        """
+        Exibe a Árvore de Decisão interativa — visão simplificada do fluxo.
+
+        Mostra APENAS os blocos com branch condicional (@%p bra), com a
+        condição do código-fonte .cu dentro de cada nó. Blocos sequenciais
+        são omitidos (contagem de instruções aparece na aresta). Loops
+        aparecem como arestas tracejadas.
+
+        Útil para entender a LÓGICA do algoritmo sem ruído de blocos auxiliares.
+
+        Args:
+            max_decisions: número máximo de nós de decisão exibidos.
+        """
+        return _plot_decision_tree(self.kernel, max_decisions)
 
     # ── exportação ───────────────────────────────────────────────────────────
 
