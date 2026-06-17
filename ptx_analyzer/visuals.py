@@ -288,12 +288,9 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
         idx = instr.source_line - 1
         return lines[idx].rstrip() if 0 <= idx < len(lines) else None
 
-    # ── BFS para atribuir nível (y) e coluna (x) ─────────────────────────────
+    # ── BFS para descobrir nós (limitado a max_blocks) ───────────────────────
     entry = order[0]
-    level_of: Dict[str, int] = {entry: 0}
-    col_counter: Dict[int, int] = {}
-    col_of: Dict[str, int] = {}
-    bfs_order = []
+    bfs_order: list = []
     visited_bfs: set = set()
     queue: deque = deque([entry])
 
@@ -303,26 +300,88 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
             continue
         visited_bfs.add(lbl)
         bfs_order.append(lbl)
-        lv = level_of.get(lbl, 0)
-        col_counter.setdefault(lv, 0)
-        col_of[lbl] = col_counter[lv]
-        col_counter[lv] += 1
         for _, target in blocks[lbl].exits:
             if target in blocks and target not in visited_bfs:
-                level_of.setdefault(target, lv + 1)
                 queue.append(target)
 
     visible = set(bfs_order)
 
+    # ── DFS iterativo para identificar back-edges reais (formam ciclos) ───────
+    # Back-edge verdadeiro = aresta para ancestral no DFS tree
+    dfs_visited: set = set()
+    dfs_stack: set = set()
+    true_back_edges: set = set()
+
+    dfs_iter: list = [(entry, iter([(e, t) for e, t in blocks[entry].exits
+                                    if t in visible]))]
+    dfs_visited.add(entry)
+    dfs_stack.add(entry)
+
+    while dfs_iter:
+        lbl, children = dfs_iter[-1]
+        try:
+            _, target = next(children)
+            if target not in visible:
+                continue
+            if target in dfs_stack:
+                true_back_edges.add((lbl, target))
+            elif target not in dfs_visited:
+                dfs_visited.add(target)
+                dfs_stack.add(target)
+                if target in blocks:
+                    dfs_iter.append((target, iter([(e, t) for e, t in blocks[target].exits
+                                                   if t in visible])))
+        except StopIteration:
+            dfs_stack.discard(lbl)
+            dfs_iter.pop()
+
+    # ── Atribuição de nível: caminho mais longo no DAG (ignora back-edges) ────
+    # Usa Kahn's algorithm para ordem topológica + longest-path
+    # Isso faz blocos de convergência (join points) ficarem abaixo de todos
+    # os predecessores, eliminando arestas que cruzam para cima/mesmo nível.
+    in_deg: Dict[str, int] = {l: 0 for l in bfs_order}
+    for lbl in bfs_order:
+        for _, target in blocks[lbl].exits:
+            if target in visible and (lbl, target) not in true_back_edges:
+                in_deg[target] = in_deg.get(target, 0) + 1
+
+    dist: Dict[str, int] = {entry: 0}
+    topo_q: deque = deque([l for l in bfs_order if in_deg.get(l, 0) == 0])
+
+    while topo_q:
+        lbl = topo_q.popleft()
+        for _, target in blocks[lbl].exits:
+            if target not in visible or (lbl, target) in true_back_edges:
+                continue
+            new_d = dist.get(lbl, 0) + 1
+            if new_d > dist.get(target, 0):
+                dist[target] = new_d
+            in_deg[target] -= 1
+            if in_deg[target] == 0:
+                topo_q.append(target)
+
+    level_of: Dict[str, int] = {l: dist.get(l, 0) for l in bfs_order}
+
+    # ── Atribuição de coluna (por nível, em ordem BFS) ────────────────────────
+    col_counter: Dict[int, int] = {}
+    col_of: Dict[str, int] = {}
+    for lbl in sorted(bfs_order, key=lambda l: (level_of.get(l, 0), bfs_order.index(l))):
+        lv = level_of[lbl]
+        col_counter.setdefault(lv, 0)
+        col_of[lbl] = col_counter[lv]
+        col_counter[lv] += 1
+
     # ── Dimensionamento dinâmico ──────────────────────────────────────────────
     max_cols_in_level = max(col_counter.values(), default=1)
-    max_depth = max(level_of.get(l, 0) for l in bfs_order) if bfs_order else 0
+    max_depth = max(level_of.values(), default=0) if level_of else 0
 
-    # Espaçamento cresce com o número de colunas para evitar sobreposição
     NODE_W = 200
     NODE_H = 60
-    X_STEP = max(NODE_W + 40, 900 // max(max_cols_in_level, 1))
-    Y_STEP = 150
+    # X_STEP: largura de coluna — mais colunas → menor passo (até 240 mín)
+    X_STEP = max(NODE_W + 40, min(300, 800 // max(max_cols_in_level, 1)))
+    Y_STEP = 160
+    # Paredes para arcos: margem fixa baseada no nó, não no X_STEP
+    _WALL_MARGIN = NODE_W * 1.6   # 320 px de folga a cada lado
 
     def _pos(lbl):
         lv = level_of.get(lbl, 0)
@@ -334,59 +393,75 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
 
     fig = go.Figure()
 
-    # ── Classificar arestas: forward vs back-edge ─────────────────────────────
-    # Back-edge: destino está no mesmo nível ou acima (loops/goto-back)
+    # ── Arestas ───────────────────────────────────────────────────────────────
+    # Convenção visual (inspirada em IDA Pro / Ghidra):
+    #   fall-through  → linha reta vertical (caminho normal)
+    #   condicional   → arco pelo lado ESQUERDO (branch taken)
+    #   jump incond.  → arco pelo lado ESQUERDO
+    #   back-edge     → arco pelo lado DIREITO, tracejado (loop/goto)
     EDGE_COLOR = {"conditional": "#f59e0b", "jump": "#3b82f6", "fallthrough": "#6b7280"}
 
     all_x_vals = [_pos(l)[0] for l in bfs_order]
-    right_wall = (max(all_x_vals) if all_x_vals else 0) + X_STEP * 0.75
+    right_wall = (max(all_x_vals) if all_x_vals else 0) + NODE_W / 2 + _WALL_MARGIN
+    left_wall  = (min(all_x_vals) if all_x_vals else 0) - NODE_W / 2 - _WALL_MARGIN
+
+    def _draw_edge(x0, y0, x1, y1, color, dash, via_left=False, via_right=False, width=1.8):
+        if via_right:
+            wall = right_wall
+            sx, tx = x0 + NODE_W / 2, x1 + NODE_W / 2
+        elif via_left:
+            wall = left_wall
+            sx, tx = x0 - NODE_W / 2, x1 - NODE_W / 2
+        else:
+            wall = None
+
+        if wall is not None:
+            fig.add_trace(go.Scatter(
+                x=[sx, wall, wall, tx, None],
+                y=[y0, y0, y1, y1, None],
+                mode="lines",
+                line=dict(color=color, width=width, dash=dash),
+                hoverinfo="skip", showlegend=False,
+            ))
+            fig.add_annotation(
+                x=tx, y=y1,
+                ax=wall, ay=y1,
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=2, arrowsize=1.0,
+                arrowwidth=width, arrowcolor=color, text="",
+            )
+        else:
+            fig.add_trace(go.Scatter(
+                x=[x0, x1, None], y=[y0 - NODE_H / 2, y1 + NODE_H / 2, None],
+                mode="lines",
+                line=dict(color=color, width=width, dash=dash),
+                hoverinfo="skip", showlegend=False,
+            ))
+            fig.add_annotation(
+                x=x1, y=y1 + NODE_H / 2,
+                ax=x0, ay=y0 - NODE_H / 2,
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=2, arrowsize=1.2,
+                arrowwidth=width, arrowcolor=color, text="",
+            )
 
     for lbl in bfs_order:
         block = blocks[lbl]
         x0, y0 = _pos(lbl)
-        lv_src = level_of.get(lbl, 0)
 
         for etype, target in block.exits:
             if target not in visible:
                 continue
             x1, y1 = _pos(target)
-            lv_tgt = level_of.get(target, 0)
             color = EDGE_COLOR.get(etype, "#6b7280")
-            is_back = lv_tgt <= lv_src and target != lbl
+            is_back = (lbl, target) in true_back_edges
 
             if is_back:
-                # Back-edge: rota pela parede direita (tracejado)
-                fig.add_trace(go.Scatter(
-                    x=[x0 + NODE_W / 2, right_wall, right_wall, x1 + NODE_W / 2, None],
-                    y=[y0, y0, y1, y1, None],
-                    mode="lines",
-                    line=dict(color=color, width=1.6, dash="dot"),
-                    hoverinfo="skip",
-                    showlegend=False,
-                ))
-                fig.add_annotation(
-                    x=x1 + NODE_W / 2, y=y1,
-                    ax=right_wall, ay=y1,
-                    xref="x", yref="y", axref="x", ayref="y",
-                    showarrow=True, arrowhead=2, arrowsize=1.0,
-                    arrowwidth=1.6, arrowcolor=color, text="",
-                )
-            else:
-                # Forward-edge: linha reta vertical
-                fig.add_trace(go.Scatter(
-                    x=[x0, x1, None], y=[y0 - NODE_H / 2, y1 + NODE_H / 2, None],
-                    mode="lines",
-                    line=dict(color=color, width=1.8),
-                    hoverinfo="skip",
-                    showlegend=False,
-                ))
-                fig.add_annotation(
-                    x=x1, y=y1 + NODE_H / 2,
-                    ax=x0, ay=y0 - NODE_H / 2,
-                    xref="x", yref="y", axref="x", ayref="y",
-                    showarrow=True, arrowhead=2, arrowsize=1.2,
-                    arrowwidth=1.8, arrowcolor=color, text="",
-                )
+                _draw_edge(x0, y0, x1, y1, color, "dot", via_right=True, width=1.5)
+            elif etype == "fallthrough":
+                _draw_edge(x0, y0, x1, y1, color, "solid")
+            else:  # conditional ou jump → lado esquerdo
+                _draw_edge(x0, y0, x1, y1, color, "solid", via_left=True)
 
     # ── Helpers para hover ────────────────────────────────────────────────────
     def _find_setp_hover(instrs):
@@ -492,10 +567,10 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
 
     # ── Legenda manual ────────────────────────────────────────────────────────
     for color, dash, name in [
-        ("#f59e0b", "solid",  "Desvio condicional (@%p bra)"),
-        ("#3b82f6", "solid",  "Salto incondicional (bra.uni)"),
-        ("#6b7280", "solid",  "Fall-through"),
-        ("#f59e0b", "dot",    "Back-edge / loop (tracejado)"),
+        ("#6b7280", "solid", "Fall-through (reto)"),
+        ("#f59e0b", "solid", "Desvio condicional (@%p bra) ← esquerda"),
+        ("#3b82f6", "solid", "Salto incondicional (bra.uni) ← esquerda"),
+        ("#f59e0b", "dot",   "Back-edge / loop (direita, tracejado)"),
     ]:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
@@ -514,14 +589,12 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
 
     # ── Layout ────────────────────────────────────────────────────────────────
     if bfs_order:
-        all_x = [_pos(l)[0] for l in bfs_order]
         all_y = [_pos(l)[1] for l in bfs_order]
-        xmarg = NODE_W + X_STEP * 1.1   # margem para os back-edges na direita
         ymarg = NODE_H * 2
-        xr = [min(all_x) - NODE_W, max(all_x) + xmarg]
+        xr = [left_wall - 20, right_wall + 20]
         yr = [min(all_y) - ymarg, max(all_y) + ymarg]
     else:
-        xr = [-200, 200]
+        xr = [-400, 400]
         yr = [-200, 50]
 
     truncated = len(blocks) > max_blocks
