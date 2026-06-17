@@ -233,82 +233,124 @@ class PTXSourceView:
 
     def show_stats(self):
         """Imprime resumo de otimizações detectadas pelo mapeamento .loc."""
-        if not self.has_lineinfo:
-            print("⚠  PTX sem informação de linha (.loc ausente).")
-            print("   Recompile com:  nvcc -ptx -lineinfo  ...")
-            return
+        import io, sys as _sys
+        _buf = io.StringIO()
+        _real = _sys.stdout
+        _sys.stdout = _buf
+        try:
+            if not self.has_lineinfo:
+                print("⚠  PTX sem informação de linha (.loc ausente).")
+                print("   Recompile com:  nvcc -ptx -lineinfo  ...")
+                return
 
-        n_total  = len(self.cu_lines)
-        n_mapped = len(self._by_line)
-        classes  = [self._classify_line(ln) for ln in range(1, n_total + 1)]
-        n_optim  = classes.count("optimized")
-        n_fma    = classes.count("fma")
-        n_heavy  = classes.count("heavy")
+            n_total  = len(self.cu_lines)
+            n_mapped = len(self._by_line)
+            classes  = [self._classify_line(ln) for ln in range(1, n_total + 1)]
+            n_optim  = classes.count("optimized")
+            n_fma    = classes.count("fma")
+            n_heavy  = classes.count("heavy")
 
-        print(f"\n{'═'*54}")
-        print(f"  {self.kernel.name}")
-        print(f"{'─'*54}")
-        print(f"  Linhas no .cu              : {n_total}")
-        print(f"  Linhas com PTX mapeado     : {n_mapped}")
-        print(f"  Linhas eliminadas (✂)      : {n_optim}"
-              + ("  ← dead code / const fold" if n_optim else ""))
-        print(f"  Linhas com FMA (⚡)         : {n_fma}")
-        print(f"  Linhas pesadas ≥6 PTX (📦) : {n_heavy}")
-        print(f"{'═'*54}\n")
+            print(f"\n{'═'*54}")
+            print(f"  {self.kernel.name}")
+            print(f"{'─'*54}")
+            print(f"  Linhas no .cu              : {n_total}")
+            print(f"  Linhas com PTX mapeado     : {n_mapped}")
+            print(f"  Linhas eliminadas (✂)      : {n_optim}"
+                  + ("  ← dead code / const fold" if n_optim else ""))
+            print(f"  Linhas com FMA (⚡)         : {n_fma}")
+            print(f"  Linhas pesadas ≥6 PTX (📦) : {n_heavy}")
+            print(f"{'═'*54}\n")
 
-        eliminated = [ln for ln, c in enumerate(classes, 1) if c == "optimized"]
-        if eliminated:
-            print("  Linhas eliminadas pelo compilador:")
-            for ln in eliminated[:15]:
-                src = self.cu_lines[ln - 1].strip()
-                print(f"    L{ln:>4}: {src[:72]}")
-            if len(eliminated) > 15:
-                print(f"    ... e mais {len(eliminated)-15}")
-            print()
+            eliminated = [ln for ln, c in enumerate(classes, 1) if c == "optimized"]
+            if eliminated:
+                print("  Linhas eliminadas pelo compilador:")
+                for ln in eliminated[:15]:
+                    src = self.cu_lines[ln - 1].strip()
+                    print(f"    L{ln:>4}: {src[:72]}")
+                if len(eliminated) > 15:
+                    print(f"    ... e mais {len(eliminated)-15}")
+                print()
+        finally:
+            _sys.stdout = _real
+            _text = _buf.getvalue()
+            try:
+                import html as _html
+                from IPython.display import display as _ipy_display
+                import ipywidgets as _w
+                _ipy_display(_w.HTML(
+                    '<pre style="background:#0f1416;color:#e8eaed;'
+                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
+                    'padding:14px;border-radius:8px;font-size:13px;'
+                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
+                    + _html.escape(_text)
+                    + '</pre>'
+                ))
+            except Exception:
+                print(_text, end='')
 
     def show_text(self, show_only_mapped: bool = False):
         """
         Imprime o mapeamento .cu ↔ PTX em formato texto puro (ASCII).
         Ideal para ambientes onde HTML/ipywidgets não estão disponíveis.
         """
-        if not self.has_lineinfo:
-            print("⚠  PTX sem informação de linha (.loc ausente).")
-            print("   Recompile com:  nvcc -ptx -lineinfo  ...")
-            return
+        import io, sys as _sys
+        _buf = io.StringIO()
+        _real = _sys.stdout
+        _sys.stdout = _buf
+        try:
+            if not self.has_lineinfo:
+                print("⚠  PTX sem informação de linha (.loc ausente).")
+                print("   Recompile com:  nvcc -ptx -lineinfo  ...")
+                return
 
-        print(f"\n{'═'*80}")
-        print(f"  Mapeamento .cu ↔ PTX  |  Kernel: {self.kernel.name}")
-        print(f"{'═'*80}\n")
+            print(f"\n{'═'*80}")
+            print(f"  Mapeamento .cu ↔ PTX  |  Kernel: {self.kernel.name}")
+            print(f"{'═'*80}\n")
 
-        for ln, raw_src in enumerate(self.cu_lines, 1):
-            instrs = self._by_line.get(ln, [])
-            cls = self._classify_line(ln)
-            
-            if show_only_mapped and not instrs:
-                continue
-            if not show_only_mapped and cls in ("blank", "inactive") and not raw_src.strip():
-                # Pula linhas vazias para economizar espaço
-                continue
+            for ln, raw_src in enumerate(self.cu_lines, 1):
+                instrs = self._by_line.get(ln, [])
+                cls = self._classify_line(ln)
 
-            badge = ""
-            if cls == "optimized": badge = "[✂ ELIMINADA]"
-            elif cls == "fma":     badge = "[⚡ FMA]"
-            elif cls == "heavy":   badge = "[📦 PESADA]"
+                if show_only_mapped and not instrs:
+                    continue
+                if not show_only_mapped and cls in ("blank", "inactive") and not raw_src.strip():
+                    continue
 
-            src_str = raw_src.strip()
-            if len(src_str) > 60:
-                src_str = src_str[:57] + "..."
+                badge = ""
+                if cls == "optimized": badge = "[✂ ELIMINADA]"
+                elif cls == "fma":     badge = "[⚡ FMA]"
+                elif cls == "heavy":   badge = "[📦 PESADA]"
 
-            # Se for linha normal sem PTX e não mapeada, imprime mais discreto
-            if not instrs and not badge and cls not in ("blank", "inactive"):
-                print(f"L{ln:<4} | {src_str}")
-            elif instrs or badge:
-                print(f"L{ln:<4} | {src_str:<60} {badge}")
-                for i in instrs:
-                    pred = f"@{i.predicate} " if i.is_predicated else ""
-                    ops = ", ".join(i.operands)
-                    print(f"       ↳ {pred}{i.op} {ops}")
-                print(f"{'─'*80}")
+                src_str = raw_src.strip()
+                if len(src_str) > 60:
+                    src_str = src_str[:57] + "..."
+
+                if not instrs and not badge and cls not in ("blank", "inactive"):
+                    print(f"L{ln:<4} | {src_str}")
+                elif instrs or badge:
+                    print(f"L{ln:<4} | {src_str:<60} {badge}")
+                    for i in instrs:
+                        pred = f"@{i.predicate} " if i.is_predicated else ""
+                        ops = ", ".join(i.operands)
+                        print(f"       ↳ {pred}{i.op} {ops}")
+                    print(f"{'─'*80}")
+        finally:
+            _sys.stdout = _real
+            _text = _buf.getvalue()
+            try:
+                import html as _html
+                from IPython.display import display as _ipy_display
+                import ipywidgets as _w
+                _ipy_display(_w.HTML(
+                    '<pre style="background:#0f1416;color:#e8eaed;'
+                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
+                    'padding:14px;border-radius:8px;font-size:13px;'
+                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
+                    + _html.escape(_text)
+                    + '</pre>'
+                ))
+            except Exception:
+                print(_text, end='')
 
     # ── renderização HTML ────────────────────────────────────────────────────
 
