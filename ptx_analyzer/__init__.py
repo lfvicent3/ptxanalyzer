@@ -9,7 +9,7 @@ from .heuristics import run_heuristics, LEVEL_ICONS, LEVEL_COLORS, LEVEL_TEXT_CO
 from .source_view import PTXSourceView
 from .utils import compile_to_ptx, analyze_all_ptx
 from .core import PTXKernel, PTXInstruction, BasicBlock, CATEGORIES, CATEGORY_COLORS, build_cfg
-from .visuals import plot_decision_tree
+from .visuals import plot_decision_tree, plot_gpu_efficiency
 
 __all__ = [
     "PTXAnalyzer",
@@ -27,6 +27,7 @@ __all__ = [
     "BasicBlock",
     "build_cfg",
     "plot_decision_tree",
+    "plot_gpu_efficiency",
     "CATEGORIES",
     "CATEGORY_COLORS",
 ]

@@ -1019,3 +1019,208 @@ def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
     )
     _show_fig(fig)
     return fig
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dashboard de Eficiência de GPU
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ARCH_PARAMS: Dict[str, tuple] = {
+    # arch → (max_regs/SM, max_threads/SM, peak_flops_TFLOPS, peak_bw_GBs)
+    "sm_75": (65536, 1024,  14.1, 448),   # RTX 2080 Ti
+    "sm_80": (65536, 2048,  19.5, 2000),  # A100
+    "sm_86": (65536, 1536,   8.1, 192),   # RTX 3050 / 3060
+    "sm_89": (65536, 1536,  49.7, 576),   # RTX 4090 (Ada)
+    "sm_90": (65536, 2048, 133.8, 3350),  # H100
+}
+
+
+def plot_gpu_efficiency(kernel: PTXKernel,
+                        arch: str = "sm_86",
+                        threads_per_block: int = 256):
+    """
+    Dashboard de eficiência de GPU — análise estática do PTX.
+
+    6 gauges:
+      • Ocupância estimada   — registradores/thread vs limite/SM
+      • Risco de divergência — branches condicionais como % das instruções
+      • Cobertura de grid    — usa padrão grid-stride (%nctaid)
+      • Posição no Roofline  — intensidade aritmética vs ridge point
+      • Eficiência de Warp   — inverso do risco de divergência
+      • Score Geral          — média ponderada das 4 métricas
+
+    Args:
+        arch: arquitetura alvo (sm_75, sm_80, sm_86, sm_89, sm_90).
+        threads_per_block: threads por bloco assumidos para estimativa de ocupância.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    max_regs_sm, max_threads_sm, def_flops, def_bw = _ARCH_PARAMS.get(
+        arch, _ARCH_PARAMS["sm_86"]
+    )
+    ridge_point = def_flops * 1000 / def_bw   # FLOPs/Byte
+
+    # ── 1. Ocupância por registradores ────────────────────────────────────────
+    regs = kernel.total_registers
+    if regs > 0:
+        max_by_regs = (max_regs_sm // regs // 32) * 32   # múltiplo de warp
+        active_threads = min(max_by_regs, max_threads_sm)
+        occupancy_pct = round(active_threads / max_threads_sm * 100, 1)
+        ideal_regs = max_regs_sm // max_threads_sm
+    else:
+        occupancy_pct, ideal_regs, active_threads = 0.0, 0, 0
+
+    # ── 2. Risco de divergência ───────────────────────────────────────────────
+    # branch_ratio de 25%+ → 100% de risco
+    divergence_pct = round(min(kernel.branch_ratio * 400, 100), 1)
+
+    # ── 3. Posição no Roofline ────────────────────────────────────────────────
+    ai = kernel.arithmetic_intensity
+    roofline_pct = round(min(ai / max(ridge_point, 0.001), 1.0) * 100, 1)
+    if ai == 0:
+        roofline_label = "sem dados"
+    elif ai < ridge_point * 0.3:
+        roofline_label = "fortemente memory-bound"
+    elif ai < ridge_point:
+        roofline_label = "memory-bound"
+    else:
+        roofline_label = "compute-bound"
+
+    # ── 4. Cobertura de grid ──────────────────────────────────────────────────
+    grid_pct = 100.0 if kernel.uses_nctaid else 0.0
+
+    # ── Score geral ───────────────────────────────────────────────────────────
+    warp_eff = 100 - divergence_pct
+    overall = round((occupancy_pct + warp_eff + roofline_pct + grid_pct) / 4, 1)
+
+    # ── Helper: gauge indicator ───────────────────────────────────────────────
+    def _gauge(value, title, reverse=False):
+        eff = (100 - value) if reverse else value
+        bar_color = "#10b981" if eff >= 70 else ("#f59e0b" if eff >= 40 else "#ef4444")
+        return go.Indicator(
+            mode="gauge+number",
+            value=value,
+            number={"suffix": "%", "font": {"size": 30, "color": "#e8eaed"}},
+            title={"text": title, "font": {"size": 12, "color": "#94a3b8"}},
+            gauge={
+                "axis": {
+                    "range": [0, 100],
+                    "tickfont": {"color": "#64748b", "size": 9},
+                    "tickcolor": "#334155",
+                },
+                "bar": {"color": bar_color, "thickness": 0.25},
+                "bgcolor": "#1e293b",
+                "bordercolor": "#334155",
+                "steps": [
+                    {"range": [0, 40],   "color": "#141b22"},
+                    {"range": [40, 70],  "color": "#181f25"},
+                    {"range": [70, 100], "color": "#152118"},
+                ],
+                "threshold": {
+                    "line": {"color": "#475569", "width": 2},
+                    "thickness": 0.75,
+                    "value": 70,
+                },
+            },
+        )
+
+    fig = make_subplots(
+        rows=2, cols=3,
+        specs=[
+            [{"type": "indicator"}, {"type": "indicator"}, {"type": "indicator"}],
+            [{"type": "indicator"}, {"type": "indicator"}, {"type": "indicator"}],
+        ],
+        vertical_spacing=0.18,
+        horizontal_spacing=0.06,
+    )
+
+    fig.add_trace(_gauge(occupancy_pct,
+        f"Ocupância<br><sup>{regs} regs/thread · {arch}</sup>"),
+        row=1, col=1)
+    fig.add_trace(_gauge(divergence_pct,
+        f"Risco de Divergência<br><sup>{kernel.predicated_branches} branches cond.</sup>",
+        reverse=True),
+        row=1, col=2)
+    fig.add_trace(_gauge(grid_pct,
+        "Cobertura de Grid<br><sup>usa %nctaid (grid-stride)</sup>"),
+        row=1, col=3)
+    fig.add_trace(_gauge(roofline_pct,
+        f"Posição Roofline<br><sup>AI={ai:.2f} — {roofline_label}</sup>"),
+        row=2, col=1)
+    fig.add_trace(_gauge(warp_eff,
+        f"Eficiência de Warp<br><sup>branch ratio={kernel.branch_ratio:.1%}</sup>"),
+        row=2, col=2)
+    fig.add_trace(_gauge(overall,
+        "<b>Score Geral</b><br><sup>média das 4 métricas</sup>"),
+        row=2, col=3)
+
+    # ── Recomendações ─────────────────────────────────────────────────────────
+    recs = []
+    if occupancy_pct < 50 and regs > 0:
+        recs.append(
+            f"▲ Ocupância baixa: {regs} regs/thread → "
+            f"{active_threads} threads/SM ativo. "
+            f"Ideal: ≤ {ideal_regs} regs para 100%."
+        )
+    if divergence_pct > 30:
+        recs.append(
+            f"▲ Divergência: {kernel.predicated_branches} branches cond. "
+            f"({kernel.branch_ratio:.1%} das instruções). "
+            "Threads do mesmo warp tomam caminhos diferentes → execução serializada."
+        )
+    if ai < ridge_point * 0.3:
+        recs.append(
+            f"▲ Memory-bound: AI={ai:.2f} vs ridge≈{ridge_point:.0f} FLOPs/B. "
+            "Aumente reutilização via shared memory ou loop tiling."
+        )
+    if not kernel.uses_nctaid:
+        recs.append(
+            "▲ Sem grid-stride: kernel não escala além de gridDim×blockDim. "
+            "Adicione loop com stride de grid."
+        )
+    if kernel.local_accesses > 0:
+        recs.append(
+            f"▲ Register spilling: {kernel.local_accesses} acessos ld/st.local "
+            "(velocidade ≈ global memory)."
+        )
+    if not recs:
+        recs.append("✓ Nenhum problema crítico detectado via análise estática.")
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"<b>Eficiência de GPU — {kernel.name}</b><br>"
+                f"<sup>Análise estática PTX · {arch} · "
+                f"{threads_per_block} threads/bloco · "
+                f"Peak {def_flops} TFLOPS / {def_bw} GB/s</sup>"
+            ),
+            font=dict(color="#e8eaed", size=15),
+            x=0.5,
+        ),
+        paper_bgcolor="#0f1416",
+        font=dict(color="#cbd5e1"),
+        height=640,
+        margin=dict(l=20, r=20, t=110, b=180),
+        annotations=[dict(
+            x=0.5, y=-0.04,
+            xref="paper", yref="paper",
+            text=(
+                "<b style='color:#64748b'>Recomendações:</b><br>"
+                + "<br>".join(
+                    f"<span style='color:#94a3b8'>{r}</span>" for r in recs
+                )
+            ),
+            showarrow=False,
+            font=dict(size=11),
+            align="left",
+            bgcolor="#111827",
+            bordercolor="#1e293b",
+            borderwidth=1,
+            borderpad=12,
+            xanchor="center",
+        )],
+    )
+
+    _show_fig(fig)
+    return fig

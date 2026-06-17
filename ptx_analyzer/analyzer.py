@@ -30,6 +30,7 @@ from .visuals import (
     plot_roofline,
     plot_branch_cfg as _plot_branch_cfg,
     plot_decision_tree as _plot_decision_tree,
+    plot_gpu_efficiency as _plot_gpu_efficiency,
 )
 from .html_render import (
     _render_overview_html, _render_instructions_html,
@@ -733,6 +734,27 @@ class PTXAnalyzer:
             max_decisions: número máximo de nós de decisão exibidos.
         """
         return _plot_decision_tree(self.kernel, max_decisions)
+
+    def plot_gpu_efficiency(self, arch: str = "sm_86", threads_per_block: int = 256):
+        """
+        Dashboard de eficiência de GPU — 6 gauges com análise estática do PTX.
+
+        Métricas:
+          • Ocupância estimada   — registradores/thread vs limite do SM
+          • Risco de Divergência — branches condicionais como % das instruções
+          • Cobertura de Grid    — kernel usa grid-stride (%nctaid)
+          • Posição no Roofline  — intensidade aritmética vs ridge point
+          • Eficiência de Warp   — inverso do risco de divergência
+          • Score Geral          — média das 4 métricas anteriores
+
+        Inclui painel de recomendações geradas automaticamente.
+
+        Args:
+            arch: arquitetura alvo para parâmetros do SM
+                  (sm_75, sm_80, sm_86, sm_89, sm_90). Default: sm_86.
+            threads_per_block: threads por bloco assumidos (padrão: 256).
+        """
+        return _plot_gpu_efficiency(self.kernel, arch, threads_per_block)
 
     # ── exportação ───────────────────────────────────────────────────────────
 
