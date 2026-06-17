@@ -231,7 +231,7 @@ class PTXComparator:
     def plot_comparison(self, *metrics: str):
         """Bar chart agrupado para as métricas especificadas."""
         import plotly.graph_objects as go
-        from .visuals import _DARK_LAYOUT
+        from .visuals import _DARK_LAYOUT, _show_fig
 
         if not metrics:
             metrics = ("Instruções", "Branches", "ld.global", "Registradores")
@@ -256,12 +256,12 @@ class PTXComparator:
             yaxis_title="Valor",
             **_DARK_LAYOUT,
         )
-        fig.show()
+        _show_fig(fig)
 
     def plot_radar(self, normalize: bool = True):
         """Radar chart do perfil de cada kernel."""
         import plotly.graph_objects as go
-        from .visuals import _DARK_LAYOUT
+        from .visuals import _DARK_LAYOUT, _show_fig
 
         radar_metrics = [
             "Instruções", "Registradores", "ld.global",
@@ -305,7 +305,7 @@ class PTXComparator:
             ),
             **_DARK_LAYOUT,
         )
-        fig.show()
+        _show_fig(fig)
 
     def plot_mix(self):
         """Stacked bar: mix de instruções (%) para todos os kernels."""

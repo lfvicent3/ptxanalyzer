@@ -17,6 +17,16 @@ _DARK_LAYOUT = dict(
 )
 
 
+def _show_fig(fig):
+    """Exibe figura Plotly no Jupyter/Colab via FigureWidget (fallback: fig.show())."""
+    try:
+        from IPython.display import display
+        import plotly.graph_objects as go
+        display(go.FigureWidget(fig))
+    except Exception:
+        fig.show()
+
+
 def plot_category_pie(kernel: PTXKernel):
     """Pie chart da distribuição de categorias de instrução."""
     import plotly.graph_objects as go
@@ -36,6 +46,7 @@ def plot_category_pie(kernel: PTXKernel):
         title=f"Distribuição — {kernel.name}",
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -59,6 +70,7 @@ def plot_category_bar(kernel: PTXKernel):
         yaxis_title="Nº de Instruções",
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -92,6 +104,7 @@ def plot_instruction_timeline(kernel: PTXKernel, max_points: int = 400):
         yaxis=dict(tickvals=list(range(len(cats))), ticktext=cats),
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -120,6 +133,7 @@ def plot_register_types(kernel: PTXKernel):
         yaxis_title="Quantidade",
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -154,6 +168,7 @@ def plot_instruction_mix_stacked(kernels: Dict[str, "PTXKernel"]):
         legend=dict(orientation="h", y=-0.25),
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -242,6 +257,7 @@ def plot_roofline(kernels: Dict[str, "PTXKernel"],
                    type="log", gridcolor="#1e293b"),
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -611,6 +627,7 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
         height=graph_height,
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -963,6 +980,7 @@ def plot_decision_tree(kernel: PTXKernel, max_decisions: int = 20):
         height=max(500, max_depth_d * Y_STEP + 350),
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
 
 
@@ -999,4 +1017,5 @@ def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
         yaxis_title="Nº de instruções de memória",
         **_DARK_LAYOUT,
     )
+    _show_fig(fig)
     return fig
