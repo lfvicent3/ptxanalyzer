@@ -249,18 +249,20 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
     """
     Grafo de Fluxo de Controle (CFG) interativo.
 
-    Cada nó representa um bloco básico (sequência de instruções sem desvio interno).
-    As arestas mostram para onde cada branch leva:
+    Cada nó representa um bloco básico. As arestas mostram o fluxo de controle:
       • Laranja  — desvio condicional (@%p bra) → divergência de warp possível
       • Azul     — salto incondicional (bra.uni) → sem divergência
       • Cinza    — fall-through (execução sequencial)
 
-    Verde = bloco de entrada  |  Vermelho = bloco de saída (ret/exit)
+    Back-edges (loops) aparecem tracejados na lateral direita do grafo.
+    Hover sobre o nó mostra a instrução PTX + linha do código-fonte .cu (quando
+    compilado com -lineinfo).
 
     Args:
         max_blocks: número máximo de blocos exibidos (BFS a partir da entrada).
     """
     import plotly.graph_objects as go
+    import os as _os
     from collections import deque
 
     blocks, order = build_cfg(kernel)
@@ -268,37 +270,59 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
         print("Nenhum bloco básico encontrado.")
         return
 
-    # ── BFS para definir nível (linha y) e coluna (x) de cada bloco ──────────
+    # ── Carrega arquivos-fonte (.cu) para exibir no hover ─────────────────────
+    src_cache: Dict[int, list] = {}
+    for fidx, fpath in kernel.file_map.items():
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as fh:
+                src_cache[fidx] = fh.readlines()
+        except OSError:
+            src_cache[fidx] = None
+
+    def _get_src(instr):
+        if instr.source_line <= 0:
+            return None
+        lines = src_cache.get(instr.source_file)
+        if not lines:
+            return None
+        idx = instr.source_line - 1
+        return lines[idx].rstrip() if 0 <= idx < len(lines) else None
+
+    # ── BFS para atribuir nível (y) e coluna (x) ─────────────────────────────
     entry = order[0]
     level_of: Dict[str, int] = {entry: 0}
     col_counter: Dict[int, int] = {}
     col_of: Dict[str, int] = {}
     bfs_order = []
-    visited = set()
-    queue = deque([entry])
+    visited_bfs: set = set()
+    queue: deque = deque([entry])
 
     while queue and len(bfs_order) < max_blocks:
         lbl = queue.popleft()
-        if lbl in visited or lbl not in blocks:
+        if lbl in visited_bfs or lbl not in blocks:
             continue
-        visited.add(lbl)
+        visited_bfs.add(lbl)
         bfs_order.append(lbl)
         lv = level_of.get(lbl, 0)
         col_counter.setdefault(lv, 0)
         col_of[lbl] = col_counter[lv]
         col_counter[lv] += 1
         for _, target in blocks[lbl].exits:
-            if target in blocks and target not in visited:
+            if target in blocks and target not in visited_bfs:
                 level_of.setdefault(target, lv + 1)
                 queue.append(target)
 
     visible = set(bfs_order)
 
-    # ── Posições dos nós ──────────────────────────────────────────────────────
-    X_STEP = 240
-    Y_STEP = 130
-    NODE_W = 210
-    NODE_H = 55
+    # ── Dimensionamento dinâmico ──────────────────────────────────────────────
+    max_cols_in_level = max(col_counter.values(), default=1)
+    max_depth = max(level_of.get(l, 0) for l in bfs_order) if bfs_order else 0
+
+    # Espaçamento cresce com o número de colunas para evitar sobreposição
+    NODE_W = 200
+    NODE_H = 60
+    X_STEP = max(NODE_W + 40, 900 // max(max_cols_in_level, 1))
+    Y_STEP = 150
 
     def _pos(lbl):
         lv = level_of.get(lbl, 0)
@@ -310,47 +334,92 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
 
     fig = go.Figure()
 
-    # ── Arestas ───────────────────────────────────────────────────────────────
+    # ── Classificar arestas: forward vs back-edge ─────────────────────────────
+    # Back-edge: destino está no mesmo nível ou acima (loops/goto-back)
     EDGE_COLOR = {"conditional": "#f59e0b", "jump": "#3b82f6", "fallthrough": "#6b7280"}
+
+    all_x_vals = [_pos(l)[0] for l in bfs_order]
+    right_wall = (max(all_x_vals) if all_x_vals else 0) + X_STEP * 0.75
 
     for lbl in bfs_order:
         block = blocks[lbl]
         x0, y0 = _pos(lbl)
+        lv_src = level_of.get(lbl, 0)
+
         for etype, target in block.exits:
             if target not in visible:
                 continue
             x1, y1 = _pos(target)
+            lv_tgt = level_of.get(target, 0)
             color = EDGE_COLOR.get(etype, "#6b7280")
-            # Linha da aresta
-            fig.add_trace(go.Scatter(
-                x=[x0, x1, None], y=[y0 - NODE_H / 2, y1 + NODE_H / 2, None],
-                mode="lines",
-                line=dict(color=color, width=1.8),
-                hoverinfo="skip",
-                showlegend=False,
-            ))
-            # Cabeça de seta via annotation
-            fig.add_annotation(
-                x=x1, y=y1 + NODE_H / 2,
-                ax=x0, ay=y0 - NODE_H / 2,
-                xref="x", yref="y", axref="x", ayref="y",
-                showarrow=True, arrowhead=2, arrowsize=1.2,
-                arrowwidth=1.8, arrowcolor=color, text="",
-            )
+            is_back = lv_tgt <= lv_src and target != lbl
 
-    # ── Nós (retângulos + texto) ──────────────────────────────────────────────
+            if is_back:
+                # Back-edge: rota pela parede direita (tracejado)
+                fig.add_trace(go.Scatter(
+                    x=[x0 + NODE_W / 2, right_wall, right_wall, x1 + NODE_W / 2, None],
+                    y=[y0, y0, y1, y1, None],
+                    mode="lines",
+                    line=dict(color=color, width=1.6, dash="dot"),
+                    hoverinfo="skip",
+                    showlegend=False,
+                ))
+                fig.add_annotation(
+                    x=x1 + NODE_W / 2, y=y1,
+                    ax=right_wall, ay=y1,
+                    xref="x", yref="y", axref="x", ayref="y",
+                    showarrow=True, arrowhead=2, arrowsize=1.0,
+                    arrowwidth=1.6, arrowcolor=color, text="",
+                )
+            else:
+                # Forward-edge: linha reta vertical
+                fig.add_trace(go.Scatter(
+                    x=[x0, x1, None], y=[y0 - NODE_H / 2, y1 + NODE_H / 2, None],
+                    mode="lines",
+                    line=dict(color=color, width=1.8),
+                    hoverinfo="skip",
+                    showlegend=False,
+                ))
+                fig.add_annotation(
+                    x=x1, y=y1 + NODE_H / 2,
+                    ax=x0, ay=y0 - NODE_H / 2,
+                    xref="x", yref="y", axref="x", ayref="y",
+                    showarrow=True, arrowhead=2, arrowsize=1.2,
+                    arrowwidth=1.8, arrowcolor=color, text="",
+                )
+
+    # ── Helpers para hover ────────────────────────────────────────────────────
+    def _find_setp_hover(instrs):
+        if not instrs:
+            return None
+        bra = instrs[-1]
+        if bra.op_base != "bra" or not bra.is_predicated or not bra.predicate:
+            return None
+        pred_reg = bra.predicate.lstrip("@").lstrip("!")
+        for ins in reversed(instrs[:-1]):
+            if ins.op_base == "setp" and ins.operands and ins.operands[0] == pred_reg:
+                return ins
+        return None
+
+    def _loc_str(instr):
+        tag = f"PTX:{instr.line_no}"
+        if instr.source_line > 0:
+            fname = _os.path.basename(kernel.file_map.get(instr.source_file, ""))
+            tag += f"  {fname}:{instr.source_line}" if fname else f"  linha:{instr.source_line}"
+        return tag
+
+    # ── Nós (retângulos + texto + hover) ─────────────────────────────────────
     NODE_FILL = {
-        "entry":    ("#065f46", "#6ee7b7"),  # verde
-        "terminal": ("#7f1d1d", "#fca5a5"),  # vermelho
-        "branch":   ("#78350f", "#fcd34d"),  # amarelo/laranja
-        "normal":   ("#1e293b", "#475569"),  # azul escuro
+        "entry":    ("#065f46", "#6ee7b7"),
+        "terminal": ("#7f1d1d", "#fca5a5"),
+        "branch":   ("#78350f", "#fcd34d"),
+        "normal":   ("#1e293b", "#475569"),
     }
 
     for lbl in bfs_order:
         block = blocks[lbl]
         x, y = _pos(lbl)
         n = len(block.instructions)
-        last_raw = block.instructions[-1].raw if block.instructions else ""
 
         if block.is_entry:
             fk = "entry"
@@ -362,83 +431,76 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
             fk = "normal"
 
         fill, border = NODE_FILL[fk]
+        display_lbl = lbl.replace("__ENTRY__", "ENTRY")
 
         fig.add_shape(
             type="rect",
             x0=x - NODE_W / 2, x1=x + NODE_W / 2,
             y0=y - NODE_H / 2, y1=y + NODE_H / 2,
-            fillcolor=fill,
-            line=dict(color=border, width=1.5),
-        )
-
-        display_lbl = lbl.replace("__ENTRY__", "ENTRY")
-        label_text = (
-            f"<b>{display_lbl}</b><br>"
-            f"<span style='font-size:10px;color:#94a3b8'>{n} instr</span>"
+            fillcolor=fill, line=dict(color=border, width=1.5),
         )
         fig.add_annotation(
-            x=x, y=y, text=label_text,
+            x=x, y=y,
+            text=f"<b>{display_lbl}</b><br>"
+                 f"<span style='font-size:10px;color:#94a3b8'>{n} instr</span>",
             showarrow=False,
             font=dict(size=11, color="#f1f5f9"),
-            xref="x", yref="y",
-            align="center",
+            xref="x", yref="y", align="center",
         )
 
-        # Ponto invisível para hover com detalhes
-        import os as _os
+        # Hover detalhado com PTX + fonte .cu
         last_instr = block.instructions[-1] if block.instructions else None
-        exits_str = ", ".join(f"{t}→{tgt}" for t, tgt in block.exits[:3]) or "—"
-
-        # Encontra setp que gera o predicado do branch final
-        def _find_setp_hover(instrs):
-            if not instrs:
-                return None
-            bra = instrs[-1]
-            if bra.op_base != "bra" or not bra.is_predicated or not bra.predicate:
-                return None
-            pred_reg = bra.predicate.lstrip("@").lstrip("!")
-            for ins in reversed(instrs[:-1]):
-                if ins.op_base == "setp" and ins.operands and ins.operands[0] == pred_reg:
-                    return ins
-            return None
-
-        def _loc_hover(instr):
-            tag = f"PTX:{instr.line_no}"
-            if instr.source_line > 0:
-                fname = _os.path.basename(kernel.file_map.get(instr.source_file, ""))
-                tag += f" / {fname}:{instr.source_line}" if fname else f" / src:{instr.source_line}"
-            return tag
+        exits_str = "  ".join(f"{e}→{t}" for e, t in block.exits[:3]) or "—"
 
         setp_instr = _find_setp_hover(block.instructions)
         branch_detail = ""
+
         if setp_instr:
-            branch_detail += f"<br>setp: {setp_instr.raw.strip()[:55]}<br>  {_loc_hover(setp_instr)}"
+            setp_src = _get_src(setp_instr)
+            branch_detail += (
+                f"<br><b>setp:</b> {setp_instr.raw.strip()[:52]}"
+                f"<br>  📍 {_loc_str(setp_instr)}"
+            )
+            if setp_src:
+                branch_detail += f"<br>  <i>{setp_src.strip()[:55]}</i>"
+
         if last_instr and last_instr.op_base in ("bra", "brx"):
-            branch_detail += f"<br>bra:  {last_instr.raw.strip()[:55]}<br>  {_loc_hover(last_instr)}"
+            bra_src = _get_src(last_instr)
+            branch_detail += (
+                f"<br><b>bra:</b>  {last_instr.raw.strip()[:52]}"
+                f"<br>  📍 {_loc_str(last_instr)}"
+            )
+            if bra_src and bra_src != (_get_src(setp_instr) if setp_instr else None):
+                branch_detail += f"<br>  <i>{bra_src.strip()[:55]}</i>"
         elif last_instr and last_instr.op_base in ("ret", "exit"):
-            branch_detail += f"<br>{last_instr.op_base}  {_loc_hover(last_instr)}"
+            branch_detail += (
+                f"<br><b>{last_instr.op_base}</b>  {_loc_str(last_instr)}"
+            )
 
         fig.add_trace(go.Scatter(
             x=[x], y=[y], mode="markers",
-            marker=dict(size=NODE_W * 0.9, opacity=0, symbol="square"),
+            marker=dict(size=NODE_W * 0.85, opacity=0, symbol="square"),
             hovertemplate=(
                 f"<b>{display_lbl}</b><br>"
                 f"Instruções: {n}<br>"
                 f"Saídas: {exits_str}"
-                f"{branch_detail}<extra></extra>"
+                f"{branch_detail}"
+                "<extra></extra>"
             ),
             showlegend=False,
         ))
 
     # ── Legenda manual ────────────────────────────────────────────────────────
-    for color, name in [
-        ("#f59e0b", "Desvio condicional (@%p bra)"),
-        ("#3b82f6", "Salto incondicional (bra.uni)"),
-        ("#6b7280", "Fall-through"),
+    for color, dash, name in [
+        ("#f59e0b", "solid",  "Desvio condicional (@%p bra)"),
+        ("#3b82f6", "solid",  "Salto incondicional (bra.uni)"),
+        ("#6b7280", "solid",  "Fall-through"),
+        ("#f59e0b", "dot",    "Back-edge / loop (tracejado)"),
     ]:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
-            line=dict(color=color, width=2), name=name, showlegend=True,
+            line=dict(color=color, width=2, dash=dash),
+            name=name, showlegend=True,
         ))
     for color, name in [
         ("#6ee7b7", "Entrada"), ("#fca5a5", "Saída (ret/exit)"),
@@ -454,9 +516,9 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
     if bfs_order:
         all_x = [_pos(l)[0] for l in bfs_order]
         all_y = [_pos(l)[1] for l in bfs_order]
-        xmarg = NODE_W
+        xmarg = NODE_W + X_STEP * 1.1   # margem para os back-edges na direita
         ymarg = NODE_H * 2
-        xr = [min(all_x) - xmarg, max(all_x) + xmarg]
+        xr = [min(all_x) - NODE_W, max(all_x) + xmarg]
         yr = [min(all_y) - ymarg, max(all_y) + ymarg]
     else:
         xr = [-200, 200]
@@ -467,12 +529,13 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
     if truncated:
         title += f"  (primeiros {max_blocks} de {len(blocks)} blocos)"
 
+    graph_height = max(600, max_depth * Y_STEP + 350)
     fig.update_layout(
         title=title,
         xaxis=dict(visible=False, range=xr),
-        yaxis=dict(visible=False, range=yr, scaleanchor="x", scaleratio=1),
+        yaxis=dict(visible=False, range=yr),
         legend=dict(orientation="h", y=-0.05, font=dict(size=11)),
-        height=max(500, level_of.get(bfs_order[-1], 0) * Y_STEP + 250) if bfs_order else 500,
+        height=graph_height,
         **_DARK_LAYOUT,
     )
     return fig

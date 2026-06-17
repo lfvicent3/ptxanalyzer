@@ -65,12 +65,14 @@ def parse_ptx(code: str) -> List[PTXKernel]:
             continue
 
         # .file N "path" — mapeamento de índice para nome de arquivo
+        # Pode aparecer em qualquer posição do PTX (dentro ou fora de kernels),
+        # então propaga para todos os kernels já parseados.
         m = _RE_FILE.match(line)
         if m:
             idx, path = int(m.group(1)), m.group(2)
             global_file_map[idx] = path
-            if current is not None:
-                current.file_map[idx] = path
+            for k in kernels:
+                k.file_map[idx] = path
             continue
 
         # .loc N line [col] — localização no código-fonte

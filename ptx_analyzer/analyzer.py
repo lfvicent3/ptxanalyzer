@@ -82,7 +82,7 @@ class PTXAnalyzer:
 
     @classmethod
     def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXAnalyzer":
-        import subprocess
+        import subprocess, os
 
         if path.endswith(".cu"):
             out_ptx = path.replace(".cu", ".ptx")
@@ -111,7 +111,28 @@ class PTXAnalyzer:
             path_to_read = path
 
         with open(path_to_read, "r", encoding="utf-8", errors="replace") as f:
-            return cls(f.read(), kernel_index)
+            code = f.read()
+
+        # PTX sem .loc → sem lineinfo → tenta localizar e recompilar o .cu
+        if not path.endswith(".cu") and ".loc " not in code:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            ptx_abs = os.path.abspath(path)
+            ptx_dir = os.path.dirname(ptx_abs)
+            search_dirs = [
+                ptx_dir,
+                os.path.normpath(os.path.join(ptx_dir, "..", "kernels")),
+                os.path.normpath(os.path.join(ptx_dir, "..")),
+                os.getcwd(),
+                os.path.join(os.getcwd(), "kernels"),
+            ]
+            for d in search_dirs:
+                candidate = os.path.normpath(os.path.join(d, f"{stem}.cu"))
+                if os.path.exists(candidate):
+                    print(f"[ptx_analyzer] PTX sem lineinfo → recompilando "
+                          f"{os.path.basename(candidate)} com -lineinfo")
+                    return cls.from_file(candidate, kernel_index, arch)
+
+        return cls(code, kernel_index)
 
     @classmethod
     def from_string(cls, ptx_code: str, kernel_index: int = 0) -> "PTXAnalyzer":
