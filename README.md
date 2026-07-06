@@ -37,6 +37,9 @@ parseia esse PTX e extrai:
 - Acessos de memória: global, shared, local (spill)
 - Grafo de Fluxo de Controle (CFG) completo a partir dos labels `$L__BB0_N`
 - Mapeamento instrução PTX → linha `.cu` (com `-lineinfo`)
+- Métricas de literatura: `instruction intensity`, `arithmetic ratio`,
+  basic blocks / arestas / loops, `branch efficiency` estimada, `bar.sync`,
+  registradores por thread, coalescência estimada e SIMD utilization estimada
 
 ### Auto-lineinfo
 
@@ -82,6 +85,14 @@ for s in ['bubble_sort', 'quick_sort', 'merge_sort']:
     comp.add(s, PTXAnalyzer.from_file(f'ptx/{s}.ptx'))
 comp.show_table()
 comp.plot_radar()
+comp.plot_instruction_roofline()
+comp.plot_metric_space()
+comp.plot_branch_registers()
+
+# Runtime: compila o .cu correspondente e executa o benchmark CUDA
+a = PTXAnalyzer.from_file('kernels/bubble_sort.cu')
+a.profile_runtime(sizes=[1024, 4096], repeats=5, arch='sm_75')
+a.show_runtime()
 ```
 
 ---
@@ -108,6 +119,11 @@ um `.ptx` contém múltiplos kernels.
 | `show_stats()` | Métricas completas: instruções, registradores, branches (total/cond/incond), setp, branch ratio, memória, FMA, shfl |
 | `show_warnings()` | Apenas os alertas de desempenho gerados pelas heurísticas |
 | `summary()` | Resumo completo: métricas + mix de instruções + diagnóstico |
+| `report(section='summary', mode='text')` | API unificada para `summary`, `stats`, `warnings`, `memory` e `hotspots`; `mode`: `text`, `html`, `raw`, `dict`, `widget` |
+| `explain(mode='text')` | Leitura guiada curta: perfil dominante, memoria, branches e hotspot principal |
+| `memory_report(mode='text')` | Breakdown e densidade de acessos globais/shared/local |
+| `control_flow(mode='text', view='cfg')` | API unificada para CFG/BRA; `mode`: `text`, `graph`, `data` |
+| `hotspots_report(mode='text')` | Ranking dos blocos com mais pressão de memória e dos `BRA` com maior risco estático de divergência |
 | `show_top_opcodes(n=10)` | Top N opcodes mais frequentes com barra ASCII |
 | `show_roofline_text(peak_flops, peak_bw)` | Posição no Roofline em texto (memory-bound vs compute-bound) |
 | `show_branch_tree()` | Árvore de desvios: bloco básico + `setp`/`bra` + linha `.cu` correspondente |
@@ -127,6 +143,8 @@ no Jupyter/Colab. Fora do Jupyter fazem fallback para `print()`.
 | `plot_mix()` | Stacked bar do mix de instruções |
 | `plot_memory_breakdown()` | Breakdown de acessos: global / shared / local |
 | `plot_roofline(peak_flops, peak_bw)` | Posição do kernel no modelo Roofline |
+| `plot_instruction_roofline(peak_ipc, mem_ceiling)` | Instruction Roofline estático |
+| `plot_memory_hierarchy()` | Diagrama da hierarquia de memória com métricas |
 
 #### CFG — Grafo de Fluxo de Controle
 
@@ -203,6 +221,44 @@ d = a.to_dict()    # dict com todas as métricas
 j = a.to_json()    # JSON formatado
 ```
 
+Se `profile_runtime()` tiver sido executado, `to_dict()` e `to_json()`
+passam a incluir também a seção `runtime` com médias, mínimo, máximo,
+desvio padrão e amostras brutas.
+
+### Runtime / benchmark
+
+```python
+from ptx_analyzer import PTXAnalyzer
+
+a = PTXAnalyzer.from_file('kernels/merge_sort.cu')
+profile = a.profile_runtime(
+    sizes=[1_024, 8_192, 65_536],
+    repeats=3,
+    arch='sm_75',
+)
+a.show_runtime()
+```
+
+O profiling de runtime:
+
+- compila o `.cu` para executável com `nvcc`
+- executa o binário para cada `N`
+- parseia saídas no formato `nome  N=1024  1.234 ms  OK`
+- agrega `min`, `max`, `mean`, `median`, `stdev` e `ok_rate`
+
+> **Pré-requisito:** o `main()` do `.cu` precisa imprimir linhas de benchmark
+> com tempo em milissegundos usando `cudaEventElapsedTime`, como os exemplos
+> em `kernels/`.
+
+Se a saída do benchmark incluir `dist=...` ou `distribution=...` no texto extra,
+também é possível gerar:
+
+```python
+a.plot_runtime_curves()
+```
+
+com curvas de tempo e sorting-rate por tamanho e distribuição de entrada.
+
 ---
 
 ## PTXComparator
@@ -227,11 +283,14 @@ comp.add('quick_sort',     a_quick)
 | `plot_mix()` | Mix de instruções empilhado para todos os kernels |
 | `plot_memory_breakdown()` | Breakdown de memória comparativo |
 | `plot_roofline(peak_flops, peak_bw)` | Roofline com todos os kernels sobrepostos |
+| `plot_instruction_roofline(peak_ipc, mem_ceiling)` | Instruction Roofline estático comparativo |
+| `plot_metric_space()` | PCA / clustering dos kernels no espaço de métricas |
+| `plot_branch_registers()` | Barras de branch efficiency e registradores por kernel |
 | `generate_report_table()` | Tabela Markdown pronta para copiar num relatório |
 
 ```python
 # Exemplo: comparar métricas específicas
-comp.plot_comparison('Instruções', 'Branches', 'ld.global', 'shl/shr')
+comp.plot_comparison('Instruções', 'BranchTotal', 'ld.global', 'Regs/Thread')
 
 # Tabela para o relatório
 print(comp.generate_report_table())
@@ -271,6 +330,7 @@ view = PTXSourceView.from_analyzer('kernels/bubble_sort.cu', analyzer)
 | `show_text(show_only_mapped=False)` | Mapeamento `.cu` ↔ PTX em texto/ASCII |
 | `show_html(show_only_mapped=False)` | Mesmo mapeamento em HTML puro |
 | `show()` | Interface ipywidgets com toggle "só linhas mapeadas" e badges coloridos |
+| `render(mode='text', view='mapping')` | API unificada do `PTXSourceView`; `mode`: `text`, `html`, `widget`, `raw`; `view`: `mapping` ou `stats` |
 
 ### Badges de linha
 
@@ -300,6 +360,14 @@ view.show_stats()
 
 ```python
 from ptx_analyzer import compile_to_ptx, analyze_all_ptx, run_heuristics, build_cfg
+```
+
+Também disponível:
+
+```python
+from ptx_analyzer import analyze_control_flow
+cfg = analyze_control_flow(analyzer.kernel)
+cfg.branch_sites[0].to_dict()
 ```
 
 ### `compile_to_ptx`
@@ -353,6 +421,19 @@ blocks, bfs_order = build_cfg(analyzer.kernel)
 - `instructions` — lista de `PTXInstruction`
 - `exits` — lista de `(tipo, label_destino)` onde tipo é `"conditional"`, `"jump"` ou `"fallthrough"`
 - `is_entry`, `is_terminal` — booleanos
+
+### `analyze_control_flow`
+
+Retorna uma estrutura mais rica que `build_cfg`, incluindo:
+- arestas tipadas com marcação de back-edge
+- sites de `BRA` com alvo `taken`, `fallthrough`, `setp` associado e risco estático de divergência
+- hotspots de memória por bloco, com contagem de `ld/st/atom/red` e densidade de memória
+- serialização pronta via `to_dict()`
+
+Nota:
+- `PTXAnalyzer.from_file('ptx/*.ptx')` agora não trava quando o PTX não tem `lineinfo`: ele tenta recompilar o `.cu` correspondente, mas continua a análise com o PTX existente se a recompilação falhar.
+- `hotspots_report(mode='data')` devolve diretamente `branch_sites`, `memory_hotspots` e `memory_density` para uso em relatórios automatizados.
+- `compare_kernels_in_ptx_file('arquivo.ptx')` compara automaticamente todos os kernels presentes no mesmo PTX, o que ajuda bastante nos casos `global/shared/register`.
 
 ---
 

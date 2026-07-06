@@ -4,9 +4,12 @@ Classe principal PTXAnalyzer.
 
 import json
 from collections import Counter
-from .core import PTXKernel, CATEGORIES
+from typing import Optional
+from .core import PTXKernel, CATEGORIES, analyze_control_flow, build_cfg
 from .parser import parse_ptx
 from .heuristics import run_heuristics, LEVEL_ICONS
+from .runtime import RuntimeProfile, profile_cuda_runtime
+from .output import emit_text
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers de saída em texto
@@ -23,12 +26,17 @@ def _bar(n: int, max_n: int, width: int = 32) -> str:
 def _section(title: str, total_w: int = 60) -> str:
     rest = total_w - len(title) - 4
     return f"── {title} {'─' * max(0, rest)}"
-from .core import build_cfg
 from .visuals import (
     plot_category_pie, plot_category_bar, plot_instruction_timeline,
     plot_register_types, plot_instruction_mix_stacked, plot_memory_access_breakdown,
     plot_roofline,
+    plot_instruction_roofline,
+    plot_metric_space_pca,
+    plot_branch_efficiency_registers,
+    plot_memory_hierarchy,
+    plot_runtime_curves,
     plot_branch_cfg as _plot_branch_cfg,
+    plot_bra_graph as _plot_bra_graph,
     plot_decision_tree as _plot_decision_tree,
     plot_gpu_efficiency as _plot_gpu_efficiency,
 )
@@ -80,12 +88,16 @@ class PTXAnalyzer:
             kernel_index = 0
         self.kernel = kernels[kernel_index]
         self._all_kernels = kernels
+        self._origin_path = None
+        self._source_path = None
+        self._ptx_path = None
+        self.runtime_profile: Optional[RuntimeProfile] = None
 
     # ── construtores alternativos ────────────────────────────────────────────
 
     @classmethod
     def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXAnalyzer":
-        import subprocess, os
+        import subprocess, os, re
 
         if path.endswith(".cu"):
             out_ptx = path.replace(".cu", ".ptx")
@@ -110,14 +122,18 @@ class PTXAnalyzer:
                 print()
 
             path_to_read = out_ptx
+            source_path = os.path.abspath(path)
         else:
             path_to_read = path
+            source_path = None
 
         with open(path_to_read, "r", encoding="utf-8", errors="replace") as f:
             code = f.read()
 
+        has_lineinfo = re.search(r'(?m)^\s*\.loc\s+\d+\s+\d+', code) is not None
+
         # PTX sem .loc → sem lineinfo → tenta localizar e recompilar o .cu
-        if not path.endswith(".cu") and ".loc " not in code:
+        if not path.endswith(".cu") and not has_lineinfo:
             stem = os.path.splitext(os.path.basename(path))[0]
             ptx_abs = os.path.abspath(path)
             ptx_dir = os.path.dirname(ptx_abs)
@@ -131,11 +147,20 @@ class PTXAnalyzer:
             for d in search_dirs:
                 candidate = os.path.normpath(os.path.join(d, f"{stem}.cu"))
                 if os.path.exists(candidate):
-                    print(f"[ptx_analyzer] PTX sem lineinfo → recompilando "
+                    print(f"[ptx_analyzer] PTX sem lineinfo → tentando recompilar "
                           f"{os.path.basename(candidate)} com -lineinfo")
-                    return cls.from_file(candidate, kernel_index, arch)
+                    try:
+                        return cls.from_file(candidate, kernel_index, arch)
+                    except Exception as exc:
+                        print(f"[ptx_analyzer] aviso: recompilação falhou, usando PTX existente sem lineinfo.\n"
+                              f"  motivo: {exc}")
+                        break
 
-        return cls(code, kernel_index)
+        analyzer = cls(code, kernel_index)
+        analyzer._origin_path = os.path.abspath(path)
+        analyzer._ptx_path = os.path.abspath(path_to_read)
+        analyzer._source_path = source_path
+        return analyzer
 
     @classmethod
     def from_string(cls, ptx_code: str, kernel_index: int = 0) -> "PTXAnalyzer":
@@ -155,117 +180,159 @@ class PTXAnalyzer:
         code = uploaded[name].decode("utf-8", errors="replace")
         return cls(code)
 
-    # ── interface de texto ───────────────────────────────────────────────────
+    def _infer_source_path(self) -> Optional[str]:
+        import os
 
-    def show_stats(self):
-        """Imprime métricas resumidas no terminal/célula."""
-        import io, sys as _sys
-        _buf = io.StringIO()
-        _real = _sys.stdout
-        _sys.stdout = _buf
-        try:
-            k = self.kernel
-            W = 56
-            print(f"\n{'═'*W}")
-            print(f"  Kernel: {k.name}")
-            print(f"{'═'*W}")
-            print(f"  Total de instruções  : {k.total_instructions}")
-            print(f"  Total de registros   : {k.total_registers}")
-            print(f"{'─'*W}")
-            print(f"  Branches total       : {k.total_branches}")
-            print(f"  Cond. (@%p bra)      : {k.predicated_branches}"
-                  "  ← divergência possível")
-            print(f"  Incond. (bra.uni)    : {k.unconditional_branches}"
-                  "  ← sem divergência")
-            print(f"  setp (comparações)   : {k.setp_count}")
-            print(f"  Branch ratio         : {k.branch_ratio:.1%}")
-            print(f"{'─'*W}")
-            print(f"  ld.global            : {k.global_loads}")
-            print(f"  st.global            : {k.global_stores}")
-            print(f"  Shared memory        : {k.shared_accesses}")
-            print(f"  Local (spill)        : {k.local_accesses}")
-            print(f"{'─'*W}")
-            print(f"  Operações atômicas   : {k.atomics}")
-            print(f"  FMA                  : {k.fma_count}")
-            print(f"  shfl.sync            : {k.shfl_count}")
-            print(f"  Int. aritmética      : {k.arithmetic_intensity:.3f}")
-            print(f"\n  Contagem por categoria:")
-            for cat, n in sorted(k.category_counts.items(), key=lambda x: -x[1]):
-                bar = "█" * min(n, 38)
-                print(f"    {cat:<14} {n:>5}  {bar}")
-            print()
-        finally:
-            _sys.stdout = _real
-            _text = _buf.getvalue()
-            try:
-                import html as _html
-                from IPython.display import display as _ipy_display
-                import ipywidgets as _w
-                _ipy_display(_w.HTML(
-                    '<pre style="background:#0f1416;color:#e8eaed;'
-                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
-                    'padding:14px;border-radius:8px;font-size:13px;'
-                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
-                    + _html.escape(_text)
-                    + '</pre>'
-                ))
-            except Exception:
-                print(_text, end='')
+        def _resolve_candidate(candidate: str) -> Optional[str]:
+            if candidate and os.path.exists(candidate):
+                return os.path.abspath(candidate)
 
-    def show_warnings(self):
-        """Imprime diagnósticos no terminal."""
+            base = os.path.basename(candidate) if candidate else ""
+            if not base:
+                return None
+
+            search_roots = []
+            if self._origin_path:
+                search_roots.extend([
+                    os.path.dirname(self._origin_path),
+                    os.path.join(os.path.dirname(self._origin_path), "..", "kernels"),
+                ])
+            search_roots.extend([os.getcwd(), os.path.join(os.getcwd(), "kernels")])
+
+            for root in search_roots:
+                alt = os.path.abspath(os.path.join(root, base))
+                if os.path.exists(alt):
+                    return alt
+            return None
+
+        if self._source_path and os.path.exists(self._source_path):
+            return self._source_path
+
+        file_candidates = []
+        for path in self.kernel.file_map.values():
+            if path and path.endswith(".cu"):
+                file_candidates.append(path)
+        for candidate in file_candidates:
+            resolved = _resolve_candidate(candidate)
+            if resolved:
+                self._source_path = resolved
+                return self._source_path
+
+        if self._origin_path:
+            base = os.path.splitext(os.path.basename(self._origin_path))[0]
+            search_roots = [
+                os.path.dirname(self._origin_path),
+                os.path.join(os.path.dirname(self._origin_path), "..", "kernels"),
+                os.getcwd(),
+                os.path.join(os.getcwd(), "kernels"),
+            ]
+            for root in search_roots:
+                candidate = os.path.abspath(os.path.join(root, f"{base}.cu"))
+                if os.path.exists(candidate):
+                    self._source_path = candidate
+                    return candidate
+        return None
+
+    def _format_stats_text(self) -> str:
+        k = self.kernel
+        W = 56
+        lines = [
+            "",
+            "═" * W,
+            f"  Kernel: {k.name}",
+            "═" * W,
+            f"  Total de instruções  : {k.total_instructions}",
+            f"  Total de registros   : {k.total_registers}",
+            "─" * W,
+            f"  Branches total       : {k.total_branches}",
+            f"  Cond. (@%p bra)      : {k.predicated_branches}  ← divergência possível",
+            f"  Incond. (bra.uni)    : {k.unconditional_branches}  ← sem divergência",
+            f"  setp (comparações)   : {k.setp_count}",
+            f"  Branch ratio         : {k.branch_ratio:.1%}",
+            "─" * W,
+            f"  ld.global            : {k.global_loads}",
+            f"  st.global            : {k.global_stores}",
+            f"  Shared memory        : {k.shared_accesses}",
+            f"  Local (spill)        : {k.local_accesses}",
+            "─" * W,
+            f"  Operações atômicas   : {k.atomics}",
+            f"  FMA                  : {k.fma_count}",
+            f"  shfl.sync            : {k.shfl_count}",
+            f"  bar.sync             : {k.bar_sync_count}",
+            f"  Basic blocks / loops : {k.basic_block_count} / {k.cfg_loop_count}",
+            f"  Branch efficiency    : {k.branch_efficiency:.1%}",
+            f"  Arithmetic ratio     : {k.arithmetic_ratio:.1%}",
+            f"  Instr. intensity     : {k.instruction_intensity:.3f}",
+            f"  Int. aritmética      : {k.arithmetic_intensity:.3f}",
+            "",
+            "  Contagem por categoria:",
+        ]
+        for cat, n in sorted(k.category_counts.items(), key=lambda x: -x[1]):
+            bar = "█" * min(n, 38)
+            lines.append(f"    {cat:<14} {n:>5}  {bar}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_warnings_text(self) -> str:
+        lines = []
         for level, msg in run_heuristics(self.kernel):
             icon = LEVEL_ICONS.get(level, "•")
-            print(f"  {icon}  {msg}")
+            lines.append(f"  {icon}  {msg}")
+        return "\n".join(lines) + ("\n" if lines else "")
 
-    def summary(self):
-        """
-        Resumo completo em texto: métricas, mix de instruções, memória e diagnóstico.
-        Equivalente text-only ao show() interativo — não requer Jupyter nem plotly.
-        """
+    def _format_memory_text(self) -> str:
+        k = self.kernel
+        d = k.memory_density
+        return "\n".join([
+            "",
+            _section(f"Memória — {k.name}", 62),
+            f"  ld.global             : {k.global_loads}",
+            f"  st.global             : {k.global_stores}",
+            f"  acessos shared        : {k.shared_accesses}",
+            f"  acessos local         : {k.local_accesses}",
+            f"  densidade ld.global   : {d['global_load_density']:.1%}",
+            f"  densidade st.global   : {d['global_store_density']:.1%}",
+            f"  densidade global total: {d['global_memory_density']:.1%}",
+            f"  intensidade instr/mem : {k.instruction_intensity:.3f}",
+            "",
+        ])
+
+    def _format_summary_text(self) -> str:
         k = self.kernel
         W = 58
-
         title = f"PTX Kernel: {k.name}  ({k.param_count} parâm.)"
-        print("╔" + "═" * W + "╗")
-        print(f"║  {title:<{W - 2}}║")
-        print("╚" + "═" * W + "╝")
-
-        # ── Métricas em 2 colunas
-        print(f"\n{_section('Métricas', W + 2)}")
+        lines = [
+            "╔" + "═" * W + "╗",
+            f"║  {title:<{W - 2}}║",
+            "╚" + "═" * W + "╝",
+            "",
+            _section("Métricas", W + 2),
+        ]
         pairs = [
-            ("Instruções totais",    k.total_instructions,
-             "Registradores",        k.total_registers),
-            ("ld.global",            k.global_loads,
-             "st.global",            k.global_stores),
-            ("ld/st.local (spill)",  k.local_accesses,
-             "Shared memory",        k.shared_accesses),
-            ("Branches total",       k.total_branches,
-             "Branch ratio",         f"{k.branch_ratio:.1%}"),
-            ("Cond. (@%p bra)",      k.predicated_branches,
-             "Incond. (.uni)",        k.unconditional_branches),
-            ("setp (predicados)",    k.setp_count,
-             "Blocos básicos",       len(build_cfg(k)[1])),
-            ("FMA",                  k.fma_count,
-             "shfl.sync",            k.shfl_count),
-            ("Int. aritmética",      k.arithmetic_intensity,
-             "Só registros",         "Sim" if k.is_register_only else "Não"),
+            ("Instruções totais",    k.total_instructions, "Registradores",        k.total_registers),
+            ("ld.global",            k.global_loads,       "st.global",            k.global_stores),
+            ("ld/st.local (spill)",  k.local_accesses,     "Shared memory",        k.shared_accesses),
+            ("Branches total",       k.total_branches,     "Branch ratio",         f"{k.branch_ratio:.1%}"),
+            ("Cond. (@%p bra)",      k.predicated_branches,"Incond. (.uni)",       k.unconditional_branches),
+            ("setp (predicados)",    k.setp_count,         "Blocos básicos",       k.basic_block_count),
+            ("FMA",                  k.fma_count,          "shfl.sync",            k.shfl_count),
+            ("Arithmetic ratio",     f"{k.arithmetic_ratio:.1%}", "Instr. intensity", k.instruction_intensity),
+            ("Int. aritmética",      k.arithmetic_intensity, "Branch efficiency",  f"{k.branch_efficiency:.1%}"),
+            ("CFG loops",            k.cfg_loop_count,     "Só registros",         "Sim" if k.is_register_only else "Não"),
         ]
         for l1, v1, l2, v2 in pairs:
-            print(f"  {l1:<22}: {str(v1):>6}    {l2:<18}: {str(v2):>6}")
+            lines.append(f"  {l1:<22}: {str(v1):>6}    {l2:<18}: {str(v2):>6}")
 
-        # ── Mix de instruções com barras
-        print(f"\n{_section('Mix de Instruções', W + 2)}")
+        lines.extend(["", _section("Mix de Instruções", W + 2)])
         mix = sorted(k.category_counts.items(), key=lambda x: -x[1])
         max_c = max((n for _, n in mix), default=1)
         total = max(k.total_instructions, 1)
         for cat, n in mix:
             pct = n / total * 100
             bar = _bar(n, max_c, 32)
-            print(f"  {cat:<14} {pct:5.1f}%  {bar}  {n:>4}")
+            lines.append(f"  {cat:<14} {pct:5.1f}%  {bar}  {n:>4}")
 
-        # ── Breakdown de memória
-        print(f"\n{_section('Memória', W + 2)}")
+        lines.extend(["", _section("Memória", W + 2)])
         mem_items = [
             ("Global loads",  k.global_loads),
             ("Global stores", k.global_stores),
@@ -275,14 +342,707 @@ class PTXAnalyzer:
         max_mem = max((v for _, v in mem_items), default=1)
         for label, n in mem_items:
             bar = _bar(n, max_mem, 30)
-            print(f"  {label:<16}: {n:>5}  {bar}")
+            lines.append(f"  {label:<16}: {n:>5}  {bar}")
 
-        # ── Diagnósticos heurísticos
-        print(f"\n{_section('Diagnóstico', W + 2)}")
+        lines.extend(["", _section("Diagnóstico", W + 2)])
         for level, msg in run_heuristics(k):
             icon = LEVEL_ICONS.get(level, "•")
-            print(f"  {icon}  {msg}")
-        print()
+            lines.append(f"  {icon}  {msg}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_control_flow_text(self, max_blocks: int = 30) -> str:
+        cfg = analyze_control_flow(self.kernel)
+        visible_blocks = cfg.order[:max_blocks]
+        visible_set = set(visible_blocks)
+        lines = [
+            "",
+            "═" * 72,
+            f"  Fluxo de Controle / BRA — {self.kernel.name}",
+            "═" * 72,
+            f"  Basic blocks     : {len(cfg.blocks)}",
+            f"  Arestas CFG      : {len(cfg.edges)}",
+            f"  Branch sites     : {len(cfg.branch_sites)}",
+            f"  Branches cond.   : {self.kernel.predicated_branches}",
+            f"  Branch ratio     : {self.kernel.branch_ratio:.1%}",
+            "",
+            "  Topologia dos blocos:",
+        ]
+        for label in visible_blocks:
+            block = cfg.blocks[label]
+            exits = ", ".join(f"{etype}->{target}" for etype, target in block.exits) or "terminal"
+            lines.append(f"    {label:<20} instr={len(block.instructions):>3}  exits=[{exits}]")
+
+        lines.extend(["", "  Sites de branch (BRA):"])
+        sites = [s for s in cfg.branch_sites if s.block_label in visible_set]
+        if not sites:
+            lines.append("    nenhum branch BRA encontrado")
+        for site in sites:
+            src = f" linha={site.source_line}" if site.source_line > 0 else ""
+            lines.append(
+                f"    {site.block_label}: {site.branch_kind} BRA PTX:{site.line_no}{src}"
+            )
+            if site.setp_raw:
+                lines.append(f"      setp: {site.setp_raw}")
+            lines.append(f"      bra : {site.raw}")
+            lines.append(
+                f"      taken={site.taken_target or '-'} "
+                f"(instr={site.taken_instruction_count}, mem={site.taken_memory_ops})"
+            )
+            lines.append(
+                f"      fall ={site.fallthrough_target or '-'} "
+                f"(instr={site.fallthrough_instruction_count}, mem={site.fallthrough_memory_ops})"
+            )
+            lines.append(f"      risco divergência: {site.divergence_risk}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_bra_text(self, max_branches: int = 24) -> str:
+        cfg = analyze_control_flow(self.kernel)
+        sites = cfg.branch_sites[:max_branches]
+        lines = [
+            "",
+            "═" * 72,
+            f"  Grafo de BRA / Divergência — {self.kernel.name}",
+            "═" * 72,
+            f"  Sites de branch: {len(cfg.branch_sites)}",
+            "",
+        ]
+        if not sites:
+            lines.append("  nenhum site de BRA encontrado")
+            lines.append("")
+            return "\n".join(lines)
+
+        for idx, site in enumerate(sites, 1):
+            loc = f"{site.source_line}" if site.source_line > 0 else f"PTX:{site.line_no}"
+            lines.append(
+                f"  B{idx:02d}  bloco={site.block_label}  origem={loc}  risco={site.divergence_risk}"
+            )
+            if site.setp_raw:
+                lines.append(f"       setp : {site.setp_raw}")
+            lines.append(f"       bra  : {site.raw}")
+            lines.append(
+                f"       taken: {site.taken_target or '-':<20} "
+                f"instr={site.taken_instruction_count:<3} mem={site.taken_memory_ops}"
+            )
+            lines.append(
+                f"       fall : {site.fallthrough_target or '-':<20} "
+                f"instr={site.fallthrough_instruction_count:<3} mem={site.fallthrough_memory_ops}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_hotspots_text(self, max_items: int = 10) -> str:
+        cfg = analyze_control_flow(self.kernel)
+        k = self.kernel
+        sites = sorted(
+            cfg.branch_sites,
+            key=lambda site: (
+                {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
+                site.taken_memory_ops + site.fallthrough_memory_ops,
+                abs(site.taken_instruction_count - site.fallthrough_instruction_count),
+            ),
+            reverse=True,
+        )[:max_items]
+        hotspots = cfg.memory_hotspots[:max_items]
+
+        lines = [
+            "",
+            "═" * 76,
+            f"  Hotspots de Divergência e Memória — {k.name}",
+            "═" * 76,
+            f"  densidade global total : {k.memory_density['global_memory_density']:.1%}",
+            f"  densidade ld.global    : {k.memory_density['global_load_density']:.1%}",
+            f"  densidade st.global    : {k.memory_density['global_store_density']:.1%}",
+            f"  branches predicados    : {k.predicated_branches}",
+            f"  branch efficiency est. : {k.branch_efficiency:.1%}",
+            "",
+            "  Top branches com maior chance de divergência:",
+        ]
+        if not sites:
+            lines.append("    nenhum BRA encontrado")
+        for idx, site in enumerate(sites, 1):
+            loc = f"linha .cu {site.source_line}" if site.source_line > 0 else f"PTX:{site.line_no}"
+            mem_total = site.taken_memory_ops + site.fallthrough_memory_ops
+            inst_delta = abs(site.taken_instruction_count - site.fallthrough_instruction_count)
+            lines.append(
+                f"    D{idx:02d}  {site.block_label:<18} {loc:<14} risco={site.divergence_risk:<6} "
+                f"mem_paths={mem_total:<2} delta_instr={inst_delta}"
+            )
+            lines.append(
+                f"         taken={site.taken_target or '-':<18} "
+                f"(instr={site.taken_instruction_count:<3} mem={site.taken_memory_ops})"
+            )
+            lines.append(
+                f"         fall ={site.fallthrough_target or '-':<18} "
+                f"(instr={site.fallthrough_instruction_count:<3} mem={site.fallthrough_memory_ops})"
+            )
+
+        lines.extend(["", "  Top blocos com pressão de memória:"])
+        if not hotspots:
+            lines.append("    nenhum bloco com ld/st/atom/red encontrado")
+        for idx, hotspot in enumerate(hotspots, 1):
+            loc = f"linha .cu {hotspot.source_line}" if hotspot.source_line > 0 else "-"
+            lines.append(
+                f"    M{idx:02d}  {hotspot.block_label:<18} {loc:<14} "
+                f"mem_ops={hotspot.memory_ops:<3} densidade={hotspot.memory_density:.1%} "
+                f"instr={hotspot.instruction_count}"
+            )
+            lines.append(
+                f"         gld={hotspot.global_loads:<2} gst={hotspot.global_stores:<2} "
+                f"shared={hotspot.shared_accesses:<2} local={hotspot.local_accesses:<2}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_explain_text(self) -> str:
+        k = self.kernel
+        cfg = analyze_control_flow(k)
+        top_branch = None
+        if cfg.branch_sites:
+            top_branch = max(
+                cfg.branch_sites,
+                key=lambda site: (
+                    {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
+                    site.taken_memory_ops + site.fallthrough_memory_ops,
+                ),
+            )
+        top_memory = cfg.memory_hotspots[0] if cfg.memory_hotspots else None
+
+        if k.global_loads + k.global_stores >= k.arithmetic_instructions:
+            dominant = "dependente de memoria global"
+        elif k.shared_accesses > 0:
+            dominant = "fortemente apoiado em memoria compartilhada"
+        elif k.local_accesses > 0:
+            dominant = "pressionado por registradores/spill local"
+        else:
+            dominant = "mais proximo de compute-bound"
+
+        lines = [
+            "",
+            "═" * 72,
+            f"  Leitura Guiada — {k.name}",
+            "═" * 72,
+            f"  1. Perfil dominante : {dominant}",
+            f"  2. Branches cond.   : {k.predicated_branches}  "
+            f"(branch ratio {k.branch_ratio:.1%}, eficiencia est. {k.branch_efficiency:.1%})",
+            f"  3. Memoria global   : {k.global_loads} loads + {k.global_stores} stores  "
+            f"(densidade {k.memory_density['global_memory_density']:.1%})",
+            f"  4. Shared / local   : shared={k.shared_accesses}  local={k.local_accesses}",
+        ]
+
+        if top_memory is not None:
+            loc = f"linha .cu {top_memory.source_line}" if top_memory.source_line > 0 else top_memory.block_label
+            lines.append(
+                f"  5. Bloco mais pesado: {loc}  "
+                f"(mem_ops={top_memory.memory_ops}, densidade={top_memory.memory_density:.1%})"
+            )
+        else:
+            lines.append("  5. Bloco mais pesado: nenhum hotspot de memoria identificado")
+
+        if top_branch is not None:
+            loc = f"linha .cu {top_branch.source_line}" if top_branch.source_line > 0 else top_branch.block_label
+            lines.append(
+                f"  6. Ponto critico de branch: {loc}  "
+                f"(risco={top_branch.divergence_risk}, "
+                f"taken_mem={top_branch.taken_memory_ops}, fall_mem={top_branch.fallthrough_memory_ops})"
+            )
+        else:
+            lines.append("  6. Ponto critico de branch: nenhum BRA encontrado")
+
+        lines.extend([
+            "",
+            "  Como ler isso:",
+            "    - Se 'memoria global' dominar, o gargalo tende a ser trafego de memoria.",
+            "    - Se 'local' aparecer, ha chance de spill e perda de ocupancia.",
+            "    - Se houver muitos branches cond., ha mais chance de divergencia de warp.",
+            "",
+        ])
+        return "\n".join(lines)
+
+    def _format_mermaid_text(self, max_decisions: int = 12) -> str:
+        cfg = analyze_control_flow(self.kernel)
+        sites = cfg.branch_sites if max_decisions <= 0 else cfg.branch_sites[:max_decisions]
+        if not sites:
+            return "graph TD\n    Entry([Inicio]) --> Exit([Sem BRA])\n"
+
+        blocks, order = build_cfg(self.kernel)
+        site_by_label = {site.block_label: site for site in sites}
+        alias_by_label = {site.block_label: f"B{idx}" for idx, site in enumerate(sites, 1)}
+        terminal_labels = set()
+
+        def _walk_to_next_bra(start_label):
+            """
+            Segue explicitamente a topologia do CFG até encontrar:
+              - outro bloco que termina em BRA
+              - um bloco terminal (ret/exit)
+            Também retorna a lista exata de blocos intermediários.
+            """
+            if not start_label or start_label not in blocks:
+                return None, []
+
+            visited = set()
+            path = []
+            cur = start_label
+
+            while cur and cur not in visited and cur in blocks:
+                visited.add(cur)
+                path.append(cur)
+                block = blocks[cur]
+
+                if cur in site_by_label:
+                    return cur, path
+                if block.is_terminal:
+                    terminal_labels.add(cur)
+                    return cur, path
+                if not block.exits:
+                    return cur, path
+                if len(block.exits) != 1:
+                    return cur, path
+
+                cur = block.exits[0][1]
+
+            return cur, path
+
+        def _node_text(label):
+            if label in site_by_label:
+                site = site_by_label[label]
+                origin = f"linha {site.source_line}" if site.source_line > 0 else f"PTX {site.line_no}"
+                raw = site.raw.strip().replace('"', "'")
+                return f"{label}<br>{origin}<br>{raw}"
+            block = blocks[label]
+            last = block.instructions[-1] if block.instructions else None
+            if block.is_terminal:
+                return f"{label}<br>{last.op_base if last else 'terminal'}"
+            return f"{label}<br>sequencial"
+
+        lines = ["graph TD", "    Entry([Inicio])"]
+        pending_edges = []
+        for site in sites:
+            src_alias = alias_by_label[site.block_label]
+            for edge_kind, target in (("taken", site.taken_target), ("fallthrough", site.fallthrough_target)):
+                end_label, path = _walk_to_next_bra(target)
+                if end_label:
+                    pending_edges.append((src_alias, edge_kind, end_label, path))
+
+        terminal_alias = {}
+        for idx, label in enumerate(sorted(terminal_labels), 1):
+            terminal_alias[label] = f"T{idx}"
+
+        bra_edges = []
+        for src_alias, edge_kind, end_label, path in pending_edges:
+            dst_alias = alias_by_label.get(end_label, terminal_alias.get(end_label))
+            if dst_alias:
+                bra_edges.append((src_alias, edge_kind, end_label, path, dst_alias))
+
+        bra_nodes = [alias_by_label[site.block_label] for site in sites]
+        order_index = {alias: idx for idx, alias in enumerate(bra_nodes)}
+
+        # Cada back-edge define uma seção de loop explícita pela ordem dos BRAs no código.
+        # Isso inclui tanto retorno para um BRA anterior quanto auto-loop
+        # (o compilador às vezes reduz um `for` para `bra $Lx` dentro do
+        # próprio bloco, como ocorre no baseline global/register).
+        raw_sections = []
+        for src_alias, _, _, _, dst_alias in bra_edges:
+            if dst_alias not in order_index or src_alias not in order_index:
+                continue
+            if order_index[dst_alias] <= order_index[src_alias]:
+                start = order_index[dst_alias]
+                end = order_index[src_alias]
+                raw_sections.append((start, end))
+
+        raw_sections = sorted(set(raw_sections), key=lambda item: (item[0], -(item[1] - item[0])))
+
+        sections = []
+        for start, end in raw_sections:
+            sections.append({
+                "name": f"Loop_{len(sections) + 1}",
+                "start": start,
+                "end": end,
+                "children": [],
+            })
+
+        parents = [None] * len(sections)
+        for i, outer in enumerate(sections):
+            best_parent = None
+            best_span = None
+            for j, candidate in enumerate(sections):
+                if i == j:
+                    continue
+                if candidate["start"] <= outer["start"] and outer["end"] <= candidate["end"]:
+                    span = candidate["end"] - candidate["start"]
+                    own_span = outer["end"] - outer["start"]
+                    if span > own_span and (best_span is None or span < best_span):
+                        best_parent = j
+                        best_span = span
+            parents[i] = best_parent
+
+        root_sections = []
+        for idx, parent_idx in enumerate(parents):
+            if parent_idx is None:
+                root_sections.append(idx)
+            else:
+                sections[parent_idx]["children"].append(idx)
+
+        covered_by_section = set()
+        for sec in sections:
+            for idx in range(sec["start"], sec["end"] + 1):
+                covered_by_section.add(idx)
+
+        linear_nodes = [alias for idx, alias in enumerate(bra_nodes) if idx not in covered_by_section]
+
+        lines.append("    subgraph Entrada")
+        lines.append("        Entry")
+        lines.append("    end")
+
+        alias_to_label = {alias: lbl for lbl, alias in alias_by_label.items()}
+
+        def _emit_section(section_idx, indent="    "):
+            sec = sections[section_idx]
+            lines.append(f"{indent}subgraph {sec['name']}")
+
+            child_ranges = [(sections[c]["start"], sections[c]["end"], c) for c in sec["children"]]
+            child_ranges.sort()
+
+            pos = sec["start"]
+            for child_start, child_end, child_idx in child_ranges:
+                while pos < child_start:
+                    alias = bra_nodes[pos]
+                    lines.append(f"{indent}    {alias}[{_node_text(alias_to_label[alias])}]")
+                    pos += 1
+                _emit_section(child_idx, indent + "    ")
+                pos = child_end + 1
+
+            while pos <= sec["end"]:
+                alias = bra_nodes[pos]
+                lines.append(f"{indent}    {alias}[{_node_text(alias_to_label[alias])}]")
+                pos += 1
+
+            lines.append(f"{indent}end")
+
+        for section_idx in root_sections:
+            _emit_section(section_idx)
+
+        if linear_nodes:
+            lines.append("    subgraph FluxoLinear")
+            for alias in linear_nodes:
+                lines.append(f"        {alias}[{_node_text(alias_to_label[alias])}]")
+            lines.append("    end")
+
+        if terminal_alias:
+            lines.append("    subgraph Saida")
+            for label, alias in terminal_alias.items():
+                lines.append(f"        {alias}([{_node_text(label)}])")
+            lines.append("    end")
+
+        lines.append("")
+        lines.append("    %% topologia explicita dos BRAs")
+        lines.append(f"    Entry --> {alias_by_label[sites[0].block_label]}")
+
+        emitted = set()
+        for src_alias, edge_kind, end_label, path, dst_alias in bra_edges:
+            intermediates = [lbl for lbl in path[:-1] if lbl in blocks and lbl not in site_by_label]
+            label = edge_kind
+            if intermediates:
+                label += " via " + " -> ".join(intermediates)
+
+            edge = (src_alias, dst_alias, label)
+            if edge in emitted:
+                continue
+            emitted.add(edge)
+            lines.append(f'    {src_alias} -- "{label}" --> {dst_alias}')
+
+        lines.extend(["", "    %% destaque"])
+        top_branch = max(
+            sites,
+            key=lambda site: (
+                {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
+                site.taken_memory_ops + site.fallthrough_memory_ops,
+            ),
+        )
+        lines.append("    style Entrada fill:#eef7ff,stroke:#2563eb,stroke-width:1px,color:#111827;")
+        lines.append("    style FluxoLinear fill:#f8fafc,stroke:#60a5fa,stroke-width:1px,color:#111827;")
+        lines.append("    style Saida fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#111827;")
+        for idx, sec in enumerate(sections, 1):
+            if idx % 2 == 1:
+                lines.append(
+                    f"    style {sec['name']} fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#111827;"
+                )
+            else:
+                lines.append(
+                    f"    style {sec['name']} fill:#faf5ff,stroke:#9333ea,stroke-width:1px,color:#111827;"
+                )
+
+        for alias in linear_nodes:
+            lines.append(f"    style {alias} fill:#ffffff,stroke:#60a5fa,stroke-width:1px,color:#111827;")
+
+        loop_node_aliases = [bra_nodes[idx] for idx in sorted(covered_by_section)]
+        for alias in loop_node_aliases:
+            lines.append(f"    style {alias} fill:#fffbeb,stroke:#f59e0b,stroke-width:1px,color:#111827;")
+
+        lines.append(
+            f"    style {alias_by_label[top_branch.block_label]} fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#111827;"
+        )
+        for label, alias in terminal_alias.items():
+            lines.append(f"    style {alias} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+        return "\n".join(lines) + "\n"
+
+    def _format_mermaid_fence(self, max_decisions: int = 12) -> str:
+        graph = self._format_mermaid_text(max_decisions=max_decisions).rstrip()
+        return f"```mermaid\n{graph}\n```"
+
+    def report(self, section: str = "summary", mode: str = "text"):
+        """
+        Interface unificada para saídas textuais/HTML do analisador.
+
+        Args:
+            section:
+                - "summary"
+                - "stats"
+                - "warnings"
+                - "memory"
+                - "hotspots"
+                - "explain"
+            mode:
+                - "text"
+                - "html"
+                - "raw"
+                - "dict"  (somente para summary/stats/memory)
+                - "widget" (abre a UI antiga `show()`)
+        """
+        section = section.lower()
+        mode = mode.lower()
+
+        if mode == "widget":
+            return self.show()
+
+        if mode == "dict":
+            if section in ("summary", "stats"):
+                return self.to_dict()
+            if section == "memory":
+                return {
+                    "global_loads": self.kernel.global_loads,
+                    "global_stores": self.kernel.global_stores,
+                    "shared_accesses": self.kernel.shared_accesses,
+                    "local_accesses": self.kernel.local_accesses,
+                    **self.kernel.memory_density,
+                }
+            if section == "hotspots":
+                cfg = analyze_control_flow(self.kernel)
+                return {
+                    "branch_sites": [site.to_dict() for site in cfg.branch_sites],
+                    "memory_hotspots": [hotspot.to_dict() for hotspot in cfg.memory_hotspots],
+                }
+            if section == "explain":
+                cfg = analyze_control_flow(self.kernel)
+                top_branch = None
+                if cfg.branch_sites:
+                    top_branch = max(
+                        cfg.branch_sites,
+                        key=lambda site: (
+                            {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
+                            site.taken_memory_ops + site.fallthrough_memory_ops,
+                        ),
+                    )
+                return {
+                    "kernel": self.kernel.name,
+                    "dominant_profile": (
+                        "memory-global"
+                        if self.kernel.global_loads + self.kernel.global_stores >= self.kernel.arithmetic_instructions
+                        else "shared"
+                        if self.kernel.shared_accesses > 0
+                        else "local-pressure"
+                        if self.kernel.local_accesses > 0
+                        else "compute-leaning"
+                    ),
+                    "top_branch": top_branch.to_dict() if top_branch else None,
+                    "top_memory_hotspot": cfg.memory_hotspots[0].to_dict() if cfg.memory_hotspots else None,
+                }
+            raise ValueError(f"Modo dict não suportado para section={section!r}")
+
+        builders = {
+            "summary": self._format_summary_text,
+            "stats": self._format_stats_text,
+            "warnings": self._format_warnings_text,
+            "memory": self._format_memory_text,
+            "hotspots": self._format_hotspots_text,
+            "explain": self._format_explain_text,
+        }
+        if section not in builders:
+            raise ValueError(f"Seção desconhecida: {section}")
+        return emit_text(builders[section](), mode=mode)
+
+    def memory_report(self, mode: str = "text"):
+        """Relatório padronizado de densidade de memória global/shared/local."""
+        if mode == "data":
+            return {
+                "global_loads": self.kernel.global_loads,
+                "global_stores": self.kernel.global_stores,
+                "shared_accesses": self.kernel.shared_accesses,
+                "local_accesses": self.kernel.local_accesses,
+                **self.kernel.memory_density,
+            }
+        return emit_text(self._format_memory_text(), mode=mode)
+
+    def hotspots_report(self, mode: str = "text", max_items: int = 10):
+        """
+        Relatório de hotspots com foco em:
+          - densidade de acessos globais
+          - blocos com maior pressão de memória
+          - branches com maior risco estático de divergência
+        """
+        if mode == "data":
+            cfg = analyze_control_flow(self.kernel)
+            return {
+                "branch_sites": [site.to_dict() for site in cfg.branch_sites[:max_items]],
+                "memory_hotspots": [hotspot.to_dict() for hotspot in cfg.memory_hotspots[:max_items]],
+                "memory_density": dict(self.kernel.memory_density),
+            }
+        return emit_text(self._format_hotspots_text(max_items=max_items), mode=mode)
+
+    def flowchart(self, mode: str = "html", max_decisions: int = 0):
+        """
+        Fluxo lógico simplificado em Mermaid.
+
+        Esta é a visualização recomendada para entendimento humano do kernel.
+        """
+        return self.control_flow(mode=mode, view="mermaid", max_decisions=max_decisions)
+
+    @property
+    def kernel_count(self) -> int:
+        return len(self._all_kernels)
+
+    @property
+    def kernel_names(self):
+        return [kernel.name for kernel in self._all_kernels]
+
+    def explain(self, mode: str = "text"):
+        """Leitura curta do kernel em linguagem mais direta."""
+        if mode == "data":
+            return self.report(section="explain", mode="dict")
+        return emit_text(self._format_explain_text(), mode=mode)
+
+    def iter_kernel_analyzers(self):
+        """
+        Retorna um analisador por kernel encontrado no mesmo PTX.
+        Útil para arquivos como baseline/bubble_sort_all com 3 variantes.
+        """
+        analyzers = []
+        for idx in range(len(self._all_kernels)):
+            item = PTXAnalyzer(self._code, kernel_index=idx)
+            item._origin_path = self._origin_path
+            item._source_path = self._source_path
+            item._ptx_path = self._ptx_path
+            analyzers.append(item)
+        return analyzers
+
+    def compare_kernels_in_file(self):
+        """
+        Compara automaticamente todos os kernels presentes no mesmo arquivo PTX.
+        """
+        from .comparator import PTXComparator
+
+        comp = PTXComparator()
+        for analyzer in self.iter_kernel_analyzers():
+            short_name = analyzer.kernel.name
+            if "global" in short_name:
+                label = "global"
+            elif "shared" in short_name:
+                label = "shared"
+            elif "register" in short_name:
+                label = "register"
+            else:
+                label = short_name
+            comp.add(label, analyzer)
+        return comp
+
+    def flowcharts_in_file(self,
+                           mode: str = "html",
+                           max_decisions: int = 0,
+                           columns: int = 3):
+        """
+        Atalho para exibir lado a lado os fluxogramas de todos os kernels
+        presentes no mesmo arquivo PTX.
+        """
+        return self.compare_kernels_in_file().flowcharts(
+            mode=mode,
+            max_decisions=max_decisions,
+            columns=columns,
+        )
+
+    def control_flow(self,
+                     mode: str = "text",
+                     view: str = "cfg",
+                     max_blocks: int = 30,
+                     max_decisions: int = 20,
+                     max_branches: int = 24):
+        """
+        Interface unificada para análise de fluxo/branches.
+
+        Args:
+            mode:
+                - "text": relatório textual dos BRAs/CFG
+                - "graph": visualização Plotly
+                - "data": estrutura serializável com blocos, arestas e branch sites
+            view:
+                - "cfg": grafo completo de fluxo
+                - "decision": árvore simplificada de decisões
+                - "mermaid": grafo lógico em Mermaid
+        """
+        mode = mode.lower()
+        view = view.lower()
+        if mode == "data":
+            cfg = analyze_control_flow(self.kernel)
+            if view == "bra":
+                return {
+                    "branch_sites": [site.to_dict() for site in cfg.branch_sites],
+                    "branch_count": len(cfg.branch_sites),
+                }
+            if view == "mermaid":
+                return {"mermaid": self._format_mermaid_text(max_decisions=max_decisions)}
+            return cfg.to_dict()
+        if mode == "graph":
+            if view == "decision":
+                return _plot_decision_tree(self.kernel, max_decisions)
+            if view == "bra":
+                return _plot_bra_graph(self.kernel, max_branches)
+            return _plot_branch_cfg(self.kernel, max_blocks)
+        if view == "mermaid" and mode == "html":
+            fence = self._format_mermaid_fence(max_decisions=max_decisions)
+            try:
+                from IPython.display import Markdown, display
+                display(Markdown(fence))
+                return fence
+            except Exception:
+                return emit_text(fence, mode="text")
+        if mode in ("text", "html", "raw"):
+            if view == "mermaid":
+                if mode == "text":
+                    return emit_text(self._format_mermaid_fence(max_decisions=max_decisions), mode="text")
+                if mode == "raw":
+                    return self._format_mermaid_text(max_decisions=max_decisions)
+                return emit_text(self._format_mermaid_fence(max_decisions=max_decisions), mode="text")
+            if view == "bra":
+                return emit_text(self._format_bra_text(max_branches=max_branches), mode=mode)
+            return emit_text(self._format_control_flow_text(max_blocks=max_blocks), mode=mode)
+        raise ValueError(f"Modo desconhecido: {mode}")
+
+    # ── interface de texto ───────────────────────────────────────────────────
+
+    def show_stats(self):
+        """Imprime métricas resumidas no terminal/célula."""
+        return self.report(section="stats", mode="html")
+
+    def show_warnings(self):
+        """Imprime diagnósticos no terminal."""
+        return self.report(section="warnings", mode="text")
+
+    def summary(self):
+        """
+        Resumo completo em texto: métricas, mix de instruções, memória e diagnóstico.
+        Equivalente text-only ao show() interativo — não requer Jupyter nem plotly.
+        """
+        return self.report(section="summary", mode="text")
 
     def show_top_opcodes(self, n: int = 10):
         """
@@ -404,6 +1164,14 @@ class PTXAnalyzer:
         """Posição do kernel no modelo Roofline."""
         plot_roofline({self.kernel.name: self.kernel}, peak_flops, peak_bw)
 
+    def plot_instruction_roofline(self, peak_ipc: float = 128.0, mem_ceiling: float = 32.0):
+        """Instruction Roofline estático no espaço instruções/memória."""
+        plot_instruction_roofline({self.kernel.name: self.kernel}, peak_ipc, mem_ceiling)
+
+    def plot_memory_hierarchy(self):
+        """Diagrama da hierarquia de memória com métricas sobrepostas."""
+        plot_memory_hierarchy(self.kernel)
+
     # ── interface ipywidgets ─────────────────────────────────────────────────
 
     def show(self):
@@ -501,209 +1269,90 @@ class PTXAnalyzer:
 
         display(tabs)
 
+    # ── runtime ─────────────────────────────────────────────────────────────
+
+    def profile_runtime(self, sizes=(1024,), repeats: int = 3, arch: str = "sm_75",
+                        source_path: Optional[str] = None,
+                        executable_path: Optional[str] = None,
+                        extra_compile_flags=None,
+                        extra_run_args=None):
+        """
+        Compila o .cu correspondente e executa o benchmark instrumentado.
+
+        Requer que o código-fonte CUDA contenha medição com cudaEvent e imprima
+        linhas no formato:
+            nome  N=1024  1.234 ms  OK
+        """
+        src = source_path or self._infer_source_path()
+        if not src:
+            raise RuntimeError(
+                "Não foi possível localizar o .cu correspondente para profiling de runtime. "
+                "Passe source_path explicitamente."
+            )
+
+        self.runtime_profile = profile_cuda_runtime(
+            src_path=src,
+            sizes=sizes,
+            repeats=repeats,
+            arch=arch,
+            executable_path=executable_path,
+            extra_compile_flags=extra_compile_flags,
+            extra_run_args=extra_run_args,
+        )
+        self._source_path = src
+        return self.runtime_profile
+
+    def show_runtime(self):
+        """
+        Exibe um resumo textual das últimas métricas de runtime coletadas.
+        """
+        if self.runtime_profile is None:
+            print("Nenhum runtime coletado. Use profile_runtime(...) primeiro.")
+            return
+
+        rp = self.runtime_profile
+        print("\n" + "═" * 62)
+        print(f"  Runtime CUDA — {self.kernel.name}")
+        print("═" * 62)
+        print(f"  Fonte      : {rp.source_path}")
+        print(f"  Executável : {rp.executable_path}")
+        print(f"  Arquitetura: {rp.arch}")
+        print(f"  Tamanhos   : {', '.join(str(n) for n in rp.sizes)}")
+        print(f"  Repetições : {rp.repeats}")
+        print("─" * 62)
+
+        for label, bench in rp.benchmarks.items():
+            print(f"  {label}")
+            print(f"    runs     : {bench.runs}")
+            print(f"    min/avg  : {bench.min_ms:.3f} / {bench.mean_ms:.3f} ms")
+            print(f"    med/max  : {bench.median_ms:.3f} / {bench.max_ms:.3f} ms")
+            print(f"    stdev    : {bench.stdev_ms:.3f} ms")
+            print(f"    ok rate  : {bench.ok_rate:.1%}")
+            for n, stats in bench.by_size().items():
+                print(f"    N={n:<8} mean={stats['mean_ms']:.3f} ms  "
+                      f"min={stats['min_ms']:.3f}  max={stats['max_ms']:.3f}  "
+                      f"ok={stats['ok_rate']:.1%}")
+                for sample in stats["samples"]:
+                    extra = f"  {sample['extra']}" if sample["extra"] else ""
+                    print(f"      run  {sample['milliseconds']:>8.3f} ms  "
+                          f"{sample['status']}{extra}")
+        print()
+
+    def plot_runtime_curves(self):
+        """Curvas de tempo e sorting-rate por tamanho e distribuição."""
+        if self.runtime_profile is None:
+            print("Nenhum runtime coletado. Use profile_runtime(...) primeiro.")
+            return
+        return plot_runtime_curves(self.runtime_profile)
+
     # ── branches / CFG ──────────────────────────────────────────────────────
 
     def show_branch_tree(self):
         """
-        Imprime a árvore de desvios do kernel em texto.
-
-        Para cada bloco básico mostra o par (setp + bra) que causa o desvio
-        e, quando o PTX foi compilado com -lineinfo, exibe o trecho do
-        código-fonte .cu correspondente a cada branch.
-
-        Legenda de tipos de aresta:
-          →[cond]  desvio condicional (@%p bra) — pode causar divergência de warp
-          →[jump]  salto incondicional (bra.uni)
-          →[fall]  fall-through (execução sequencial)
+        Wrapper compatível com a API antiga.
+        Use `control_flow(mode="text" | "graph" | "data")` na API nova.
         """
-        import os, io, sys as _sys
-
-        k = self.kernel
-        blocks, order = build_cfg(k)
-        W = 64
-
-        # ── carrega arquivos-fonte referenciados pelo PTX ─────────────────────
-        src_cache: dict = {}   # file_idx → lista de linhas (ou None se ausente)
-        for fidx, fpath in k.file_map.items():
-            try:
-                with open(fpath, encoding="utf-8", errors="replace") as fh:
-                    src_cache[fidx] = fh.readlines()
-            except OSError:
-                src_cache[fidx] = None
-
-        def _src_line(instr):
-            """Retorna o conteúdo da linha .cu correspondente à instrução, ou None."""
-            if instr.source_line <= 0:
-                return None
-            lines = src_cache.get(instr.source_file)
-            if lines is None:
-                return None
-            idx = instr.source_line - 1
-            if 0 <= idx < len(lines):
-                return lines[idx].rstrip()
-            return None
-
-        # ── helpers ──────────────────────────────────────────────────────────
-
-        def _find_setp(instrs, bra_idx):
-            bra = instrs[bra_idx]
-            if not bra.is_predicated or not bra.predicate:
-                return None
-            pred_reg = bra.predicate.lstrip("@").lstrip("!")
-            for i in range(bra_idx - 1, -1, -1):
-                ins = instrs[i]
-                if ins.op_base == "setp" and ins.operands and ins.operands[0] == pred_reg:
-                    return ins
-            return None
-
-        def _ptx_loc(instr):
-            fname = os.path.basename(k.file_map.get(instr.source_file, ""))
-            if instr.source_line > 0 and fname:
-                return f"PTX:{instr.line_no}  {fname}:{instr.source_line}"
-            return f"PTX:{instr.line_no}"
-
-        def _short(raw, width=46):
-            return raw.strip()[:width]
-
-        def _print_branch_detail(detail, instr, label):
-            """Imprime linha PTX + código-fonte correspondente."""
-            src = _src_line(instr)
-            loc = _ptx_loc(instr)
-            print(f"{detail}{label}  {_short(instr.raw):<46}  [{loc}]")
-            if src:
-                src_trimmed = src.strip()[:70]
-                print(f"{detail}       ╰─ {src_trimmed}")
-
-        # ── cabeçalho ────────────────────────────────────────────────────────
-
-        has_src = any(i.source_line > 0 for i in k.instructions)
-        has_src_files = any(v is not None for v in src_cache.values())
-
-        _buf = io.StringIO()
-        _real_stdout = _sys.stdout
-        _sys.stdout = _buf
-
-        print(f"\n{'═'*W}")
-        print(f"  Árvore de Desvios — {k.name}")
-        print(f"{'═'*W}")
-        print(f"  Blocos básicos       : {len(blocks)}")
-        print(f"  Branches total       : {k.total_branches}")
-        print(f"  Condicionais (@%p)   : {k.predicated_branches}"
-              "  ← potencial divergência de warp")
-        print(f"  Incondicionais (.uni): {k.unconditional_branches}"
-              "  ← sem divergência")
-        print(f"  Instruções setp      : {k.setp_count}"
-              "  ← comparações que geram predicados")
-        print(f"  Branch ratio         : {k.branch_ratio:.1%}")
-        if not has_src:
-            print(f"  (sem mapeamento de fonte — compile com -lineinfo para ver código .cu)")
-        elif not has_src_files:
-            print(f"  (arquivos .cu não encontrados nos caminhos do file_map)")
-        print(f"{'─'*W}")
-
-        EDGE_ICONS = {
-            "conditional": "→[cond] ",
-            "jump":        "→[jump] ",
-            "fallthrough": "→[fall] ",
-        }
-
-        # ── DFS ──────────────────────────────────────────────────────────────
-        visited: set = set()
-        stack = [(order[0], 0)] if order else []
-
-        while stack:
-            lbl, depth = stack.pop()
-            if lbl not in blocks:
-                continue
-
-            block = blocks[lbl]
-            display = lbl.replace("__ENTRY__", "ENTRY")
-            n = len(block.instructions)
-
-            if block.is_entry:
-                tag = "[ENTRADA]"
-            elif block.is_terminal:
-                tag = "[SAÍDA]  "
-            elif any(e == "conditional" for e, _ in block.exits):
-                tag = "[BRANCH] "
-            else:
-                tag = "         "
-
-            prefix = "  " + "│  " * depth
-            connector = "└─" if depth else "  "
-            already = " (já visitado)" if lbl in visited else ""
-            print(f"{prefix}{connector}{tag} {display}  ({n} instrs){already}")
-
-            if lbl in visited:
-                continue
-            visited.add(lbl)
-
-            # Detalhe do branch terminador do bloco
-            detail = "  " + "   " * depth + "     "
-            last = block.instructions[-1] if block.instructions else None
-
-            if last and last.op_base == "bra":
-                bra_idx = len(block.instructions) - 1
-                if last.is_predicated:
-                    setp = _find_setp(block.instructions, bra_idx)
-                    if setp:
-                        # Mostrar setp com sua linha de código-fonte
-                        _print_branch_detail(detail, setp, "setp ")
-                    # Mostrar bra — só repetir o código-fonte se for linha diferente do setp
-                    bra_src = _src_line(last)
-                    setp_src = _src_line(setp) if setp else None
-                    if bra_src and bra_src != setp_src:
-                        _print_branch_detail(detail, last, "bra  ")
-                    else:
-                        loc = _ptx_loc(last)
-                        print(f"{detail}bra    {_short(last.raw):<46}  [{loc}]")
-                else:
-                    _print_branch_detail(detail, last, "jump ")
-            elif last and last.op_base in ("ret", "exit", "brx"):
-                loc = _ptx_loc(last)
-                print(f"{detail}{last.op_base:<6} {'':<46}  [{loc}]")
-
-            # Arestas de saída
-            for etype, target in reversed(block.exits):
-                icon = EDGE_ICONS.get(etype, "→ ")
-                print(f"{detail}{icon}{target}")
-                if target not in visited:
-                    stack.append((target, depth + 1))
-
-        # Blocos com back-edges / não alcançados pelo DFS
-        unreachable = [l for l in order if l not in visited and l in blocks]
-        if unreachable:
-            print(f"\n  Blocos com back-edges / não alcançados pelo DFS ({len(unreachable)}):")
-            for lbl in unreachable[:12]:
-                b = blocks[lbl]
-                last = b.instructions[-1] if b.instructions else None
-                loc_str = f"  {_ptx_loc(last)}" if last else ""
-                exits_str = "  ".join(
-                    f"{EDGE_ICONS.get(e,'→')}{t}" for e, t in b.exits[:3]
-                )
-                print(f"    {lbl:<28} ({len(b.instructions):>3} instrs){loc_str}")
-                if exits_str:
-                    print(f"    {'':28}  {exits_str}")
-            if len(unreachable) > 12:
-                print(f"    ... e mais {len(unreachable) - 12} blocos")
-        print()
-
-        _sys.stdout = _real_stdout
-        _text = _buf.getvalue()
-        try:
-            import html as _html
-            from IPython.display import display as _ipy_display
-            import ipywidgets as _w
-            _ipy_display(_w.HTML(
-                '<pre style="background:#0f1416;color:#e8eaed;'
-                'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
-                'padding:14px;border-radius:8px;font-size:13px;'
-                'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
-                + _html.escape(_text)
-                + '</pre>'
-            ))
-        except Exception:
-            print(_text, end='')
+        return self.control_flow(mode="text", view="cfg")
 
     def plot_branch_cfg(self, max_blocks: int = 30):
         """
@@ -717,23 +1366,23 @@ class PTXAnalyzer:
         Args:
             max_blocks: número máximo de blocos mostrados (BFS a partir da entrada).
         """
-        return _plot_branch_cfg(self.kernel, max_blocks)
+        return self.control_flow(mode="graph", view="cfg", max_blocks=max_blocks)
 
-    def plot_decision_tree(self, max_decisions: int = 20):
+    def plot_decision_tree(self, max_decisions: int = 0):
         """
-        Exibe a Árvore de Decisão interativa — visão simplificada do fluxo.
+        Exibe o fluxo lógico simplificado em Mermaid.
 
-        Mostra APENAS os blocos com branch condicional (@%p bra), com a
-        condição do código-fonte .cu dentro de cada nó. Blocos sequenciais
-        são omitidos (contagem de instruções aparece na aresta). Loops
-        aparecem como arestas tracejadas.
-
-        Útil para entender a LÓGICA do algoritmo sem ruído de blocos auxiliares.
-
-        Args:
-            max_decisions: número máximo de nós de decisão exibidos.
+        A versão Plotly da decision tree ficou muito poluída para kernels
+        reais; por isso este método agora prioriza Mermaid, que tem melhor
+        autorroteamento e leitura mais limpa.
         """
-        return _plot_decision_tree(self.kernel, max_decisions)
+        return self.flowchart(mode="html", max_decisions=max_decisions)
+
+    def plot_bra_graph(self, max_branches: int = 24):
+        """
+        Exibe um grafo simplificado dos sites de `BRA`, seus destinos e risco de divergência.
+        """
+        return self.control_flow(mode="graph", view="bra", max_branches=max_branches)
 
     def plot_gpu_efficiency(self, arch: str = "sm_86", threads_per_block: int = 256):
         """
@@ -766,6 +1415,7 @@ class PTXAnalyzer:
             "categories":  k.category_counts,
             "registers":   {t: list(r) for t, r in k.reg_decls.items()},
             "diagnostics": run_heuristics(k),
+            "runtime":     self.runtime_profile.to_dict() if self.runtime_profile else None,
         }
 
     def to_json(self, indent: int = 2) -> str:

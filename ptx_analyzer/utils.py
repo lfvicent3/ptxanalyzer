@@ -59,3 +59,15 @@ def analyze_all_ptx(ptx_dir: str) -> PTXComparator:
             except Exception as e:
                 print(f"[aviso] {fname}: {e}")
     return comp
+
+
+def compare_kernels_in_ptx_file(ptx_path: str) -> PTXComparator:
+    """
+    Carrega um único arquivo PTX e compara todos os kernels contidos nele.
+
+    Exemplo:
+        comp = compare_kernels_in_ptx_file("./ptx/baseline.ptx")
+        comp.summary()
+    """
+    analyzer = PTXAnalyzer.from_file(ptx_path)
+    return analyzer.compare_kernels_in_file()

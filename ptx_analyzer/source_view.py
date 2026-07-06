@@ -7,6 +7,7 @@ from collections import defaultdict
 from typing import Dict, List
 from .core import PTXKernel, PTXInstruction, CATEGORY_COLORS
 from .parser import parse_ptx
+from .output import emit_text
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 10. PTXSourceView
@@ -233,124 +234,92 @@ class PTXSourceView:
 
     def show_stats(self):
         """Imprime resumo de otimizações detectadas pelo mapeamento .loc."""
-        import io, sys as _sys
-        _buf = io.StringIO()
-        _real = _sys.stdout
-        _sys.stdout = _buf
-        try:
-            if not self.has_lineinfo:
-                print("⚠  PTX sem informação de linha (.loc ausente).")
-                print("   Recompile com:  nvcc -ptx -lineinfo  ...")
-                return
+        return self.render(mode="html", view="stats")
 
-            n_total  = len(self.cu_lines)
-            n_mapped = len(self._by_line)
-            classes  = [self._classify_line(ln) for ln in range(1, n_total + 1)]
-            n_optim  = classes.count("optimized")
-            n_fma    = classes.count("fma")
-            n_heavy  = classes.count("heavy")
+    def _format_stats_text(self) -> str:
+        if not self.has_lineinfo:
+            return "⚠  PTX sem informação de linha (.loc ausente).\n   Recompile com:  nvcc -ptx -lineinfo  ...\n"
 
-            print(f"\n{'═'*54}")
-            print(f"  {self.kernel.name}")
-            print(f"{'─'*54}")
-            print(f"  Linhas no .cu              : {n_total}")
-            print(f"  Linhas com PTX mapeado     : {n_mapped}")
-            print(f"  Linhas eliminadas (✂)      : {n_optim}"
-                  + ("  ← dead code / const fold" if n_optim else ""))
-            print(f"  Linhas com FMA (⚡)         : {n_fma}")
-            print(f"  Linhas pesadas ≥6 PTX (📦) : {n_heavy}")
-            print(f"{'═'*54}\n")
+        n_total = len(self.cu_lines)
+        n_mapped = len(self._by_line)
+        classes = [self._classify_line(ln) for ln in range(1, n_total + 1)]
+        n_optim = classes.count("optimized")
+        n_fma = classes.count("fma")
+        n_heavy = classes.count("heavy")
 
-            eliminated = [ln for ln, c in enumerate(classes, 1) if c == "optimized"]
-            if eliminated:
-                print("  Linhas eliminadas pelo compilador:")
-                for ln in eliminated[:15]:
-                    src = self.cu_lines[ln - 1].strip()
-                    print(f"    L{ln:>4}: {src[:72]}")
-                if len(eliminated) > 15:
-                    print(f"    ... e mais {len(eliminated)-15}")
-                print()
-        finally:
-            _sys.stdout = _real
-            _text = _buf.getvalue()
-            try:
-                import html as _html
-                from IPython.display import display as _ipy_display
-                import ipywidgets as _w
-                _ipy_display(_w.HTML(
-                    '<pre style="background:#0f1416;color:#e8eaed;'
-                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
-                    'padding:14px;border-radius:8px;font-size:13px;'
-                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
-                    + _html.escape(_text)
-                    + '</pre>'
-                ))
-            except Exception:
-                print(_text, end='')
+        lines = [
+            "",
+            "═" * 54,
+            f"  {self.kernel.name}",
+            "─" * 54,
+            f"  Linhas no .cu              : {n_total}",
+            f"  Linhas com PTX mapeado     : {n_mapped}",
+            f"  Linhas eliminadas (✂)      : {n_optim}" + ("  ← dead code / const fold" if n_optim else ""),
+            f"  Linhas com FMA (⚡)         : {n_fma}",
+            f"  Linhas pesadas ≥6 PTX (📦) : {n_heavy}",
+            "═" * 54,
+            "",
+        ]
+        eliminated = [ln for ln, c in enumerate(classes, 1) if c == "optimized"]
+        if eliminated:
+            lines.append("  Linhas eliminadas pelo compilador:")
+            for ln in eliminated[:15]:
+                src = self.cu_lines[ln - 1].strip()
+                lines.append(f"    L{ln:>4}: {src[:72]}")
+            if len(eliminated) > 15:
+                lines.append(f"    ... e mais {len(eliminated)-15}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _format_mapping_text(self, show_only_mapped: bool = False) -> str:
+        if not self.has_lineinfo:
+            return "⚠  PTX sem informação de linha (.loc ausente).\n   Recompile com:  nvcc -ptx -lineinfo  ...\n"
+
+        lines = [
+            "",
+            "═" * 80,
+            f"  Mapeamento .cu ↔ PTX  |  Kernel: {self.kernel.name}",
+            "═" * 80,
+            "",
+        ]
+        for ln, raw_src in enumerate(self.cu_lines, 1):
+            instrs = self._by_line.get(ln, [])
+            cls = self._classify_line(ln)
+
+            if show_only_mapped and not instrs:
+                continue
+            if not show_only_mapped and cls in ("blank", "inactive") and not raw_src.strip():
+                continue
+
+            badge = ""
+            if cls == "optimized":
+                badge = "[✂ ELIMINADA]"
+            elif cls == "fma":
+                badge = "[⚡ FMA]"
+            elif cls == "heavy":
+                badge = "[📦 PESADA]"
+
+            src_str = raw_src.strip()
+            if len(src_str) > 60:
+                src_str = src_str[:57] + "..."
+
+            if not instrs and not badge and cls not in ("blank", "inactive"):
+                lines.append(f"L{ln:<4} | {src_str}")
+            elif instrs or badge:
+                lines.append(f"L{ln:<4} | {src_str:<60} {badge}")
+                for i in instrs:
+                    pred = f"@{i.predicate} " if i.is_predicated else ""
+                    ops = ", ".join(i.operands)
+                    lines.append(f"       ↳ {pred}{i.op} {ops}")
+                lines.append("─" * 80)
+        return "\n".join(lines)
 
     def show_text(self, show_only_mapped: bool = False):
         """
         Imprime o mapeamento .cu ↔ PTX em formato texto puro (ASCII).
         Ideal para ambientes onde HTML/ipywidgets não estão disponíveis.
         """
-        import io, sys as _sys
-        _buf = io.StringIO()
-        _real = _sys.stdout
-        _sys.stdout = _buf
-        try:
-            if not self.has_lineinfo:
-                print("⚠  PTX sem informação de linha (.loc ausente).")
-                print("   Recompile com:  nvcc -ptx -lineinfo  ...")
-                return
-
-            print(f"\n{'═'*80}")
-            print(f"  Mapeamento .cu ↔ PTX  |  Kernel: {self.kernel.name}")
-            print(f"{'═'*80}\n")
-
-            for ln, raw_src in enumerate(self.cu_lines, 1):
-                instrs = self._by_line.get(ln, [])
-                cls = self._classify_line(ln)
-
-                if show_only_mapped and not instrs:
-                    continue
-                if not show_only_mapped and cls in ("blank", "inactive") and not raw_src.strip():
-                    continue
-
-                badge = ""
-                if cls == "optimized": badge = "[✂ ELIMINADA]"
-                elif cls == "fma":     badge = "[⚡ FMA]"
-                elif cls == "heavy":   badge = "[📦 PESADA]"
-
-                src_str = raw_src.strip()
-                if len(src_str) > 60:
-                    src_str = src_str[:57] + "..."
-
-                if not instrs and not badge and cls not in ("blank", "inactive"):
-                    print(f"L{ln:<4} | {src_str}")
-                elif instrs or badge:
-                    print(f"L{ln:<4} | {src_str:<60} {badge}")
-                    for i in instrs:
-                        pred = f"@{i.predicate} " if i.is_predicated else ""
-                        ops = ", ".join(i.operands)
-                        print(f"       ↳ {pred}{i.op} {ops}")
-                    print(f"{'─'*80}")
-        finally:
-            _sys.stdout = _real
-            _text = _buf.getvalue()
-            try:
-                import html as _html
-                from IPython.display import display as _ipy_display
-                import ipywidgets as _w
-                _ipy_display(_w.HTML(
-                    '<pre style="background:#0f1416;color:#e8eaed;'
-                    'font-family:ui-monospace,Consolas,\'Courier New\',monospace;'
-                    'padding:14px;border-radius:8px;font-size:13px;'
-                    'line-height:1.55;overflow-x:auto;white-space:pre;margin:0">'
-                    + _html.escape(_text)
-                    + '</pre>'
-                ))
-            except Exception:
-                print(_text, end='')
+        return self.render(mode="text", view="mapping", show_only_mapped=show_only_mapped)
 
     # ── renderização HTML ────────────────────────────────────────────────────
 
@@ -627,17 +596,53 @@ class PTXSourceView:
 
     def show_html(self, show_only_mapped: bool = False):
         """Exibe HTML estático (sem ipywidgets)."""
-        try:
-            from IPython.display import HTML, display
-            display(HTML(self._build_html("mapped" if show_only_mapped else "all")))
-        except ImportError:
-            self.show_stats()
+        return self.render(mode="html", view="mapping", show_only_mapped=show_only_mapped)
 
     def show(self):
         """
         Interface interativa com ipywidgets: barra de filtros, legenda e
         visualização lado a lado código-fonte ↔ PTX com tema GitHub dark.
         """
+        return self.render(mode="widget", view="mapping")
+
+    def render(self,
+               mode: str = "text",
+               view: str = "mapping",
+               show_only_mapped: bool = False):
+        """
+        Interface unificada para o mapeamento fonte ↔ PTX.
+
+        Args:
+            mode:
+                - "text": ASCII
+                - "html": HTML estático
+                - "widget": UI interativa ipywidgets
+                - "raw": retorna string textual
+            view:
+                - "mapping": lado a lado .cu ↔ PTX
+                - "stats": resumo das linhas mapeadas/otimizadas
+        """
+        mode = mode.lower()
+        view = view.lower()
+
+        if mode in ("text", "raw"):
+            if view == "stats":
+                return emit_text(self._format_stats_text(), mode=mode)
+            return emit_text(self._format_mapping_text(show_only_mapped=show_only_mapped), mode=mode)
+
+        if mode == "html":
+            if view == "stats":
+                return emit_text(self._format_stats_text(), mode="html")
+            try:
+                from IPython.display import HTML, display
+                display(HTML(self._build_html("mapped" if show_only_mapped else "all")))
+                return None
+            except ImportError:
+                return emit_text(self._format_mapping_text(show_only_mapped=show_only_mapped), mode="text")
+
+        if mode != "widget":
+            raise ValueError(f"Modo desconhecido: {mode}")
+
         if not self.has_lineinfo:
             print("⚠  PTX sem diretivas .loc.")
             print("   Recompile com:  nvcc -ptx -lineinfo kernel.cu -arch=sm_XX ...")

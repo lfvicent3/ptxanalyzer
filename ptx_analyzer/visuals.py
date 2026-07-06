@@ -3,7 +3,7 @@ Visualizações com Plotly para análise PTX.
 """
 
 from typing import Dict
-from .core import PTXKernel, CATEGORIES, CATEGORY_COLORS, build_cfg
+from .core import PTXKernel, CATEGORIES, CATEGORY_COLORS, build_cfg, analyze_control_flow
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Visualizações (Plotly)
@@ -15,6 +15,30 @@ _DARK_LAYOUT = dict(
     font=dict(color="#cbd5e1", size=13),
     margin=dict(l=60, r=40, t=50, b=60),
 )
+
+
+def _make_block_display_map(blocks, order):
+    branch_idx = 1
+    seq_idx = 1
+    node_idx = 1
+    display = {}
+
+    for lbl in order:
+        block = blocks[lbl]
+        if block.is_entry or lbl == "__ENTRY__":
+            display[lbl] = "ENTRY"
+        elif block.is_terminal:
+            display[lbl] = "END"
+        elif lbl.startswith("__seq_"):
+            display[lbl] = f"S{seq_idx}"
+            seq_idx += 1
+        elif any(edge_type == "conditional" for edge_type, _ in block.exits):
+            display[lbl] = f"B{branch_idx}"
+            branch_idx += 1
+        else:
+            display[lbl] = f"N{node_idx}"
+            node_idx += 1
+    return display
 
 
 def _show_fig(fig):
@@ -321,6 +345,7 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
                 queue.append(target)
 
     visible = set(bfs_order)
+    display_map = _make_block_display_map(blocks, bfs_order)
 
     # ── DFS iterativo para identificar back-edges reais (formam ciclos) ───────
     # Back-edge verdadeiro = aresta para ancestral no DFS tree
@@ -522,7 +547,10 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
             fk = "normal"
 
         fill, border = NODE_FILL[fk]
-        display_lbl = lbl.replace("__ENTRY__", "ENTRY")
+        display_lbl = display_map.get(lbl, lbl.replace("__ENTRY__", "ENTRY"))
+        branch_count = sum(1 for ins in block.instructions if ins.op_base == "bra")
+        mem_count = sum(1 for ins in block.instructions if ins.category == "memory")
+        arith_count = sum(1 for ins in block.instructions if ins.category == "arithmetic")
 
         fig.add_shape(
             type="rect",
@@ -533,7 +561,9 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
         fig.add_annotation(
             x=x, y=y,
             text=f"<b>{display_lbl}</b><br>"
-                 f"<span style='font-size:10px;color:#94a3b8'>{n} instr</span>",
+                 f"<span style='font-size:10px;color:#94a3b8'>{n} instr | mem {mem_count}</span><br>"
+                 f"<span style='font-size:9px;color:#94a3b8'>"
+                 f"branch {branch_count}</span>",
             showarrow=False,
             font=dict(size=11, color="#f1f5f9"),
             xref="x", yref="y", align="center",
@@ -541,7 +571,9 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
 
         # Hover detalhado com PTX + fonte .cu
         last_instr = block.instructions[-1] if block.instructions else None
-        exits_str = "  ".join(f"{e}→{t}" for e, t in block.exits[:3]) or "—"
+        exits_str = "  ".join(
+            f"{e}→{display_map.get(t, t)}" for e, t in block.exits[:3]
+        ) or "—"
 
         setp_instr = _find_setp_hover(block.instructions)
         branch_detail = ""
@@ -573,7 +605,11 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
             marker=dict(size=NODE_W * 0.85, opacity=0, symbol="square"),
             hovertemplate=(
                 f"<b>{display_lbl}</b><br>"
+                f"Bloco PTX: {lbl}<br>"
                 f"Instruções: {n}<br>"
+                f"Memória: {mem_count}<br>"
+                f"Aritméticas: {arith_count}<br>"
+                f"Branches: {branch_count}<br>"
                 f"Saídas: {exits_str}"
                 f"{branch_detail}"
                 "<extra></extra>"
@@ -614,7 +650,7 @@ def plot_branch_cfg(kernel: PTXKernel, max_blocks: int = 30):
         yr = [-200, 50]
 
     truncated = len(blocks) > max_blocks
-    title = f"CFG — {kernel.name}"
+    title = f"CFG Simplificado — {kernel.name}"
     if truncated:
         title += f"  (primeiros {max_blocks} de {len(blocks)} blocos)"
 
@@ -984,6 +1020,148 @@ def plot_decision_tree(kernel: PTXKernel, max_decisions: int = 20):
     return fig
 
 
+def plot_bra_graph(kernel: PTXKernel, max_branches: int = 24):
+    """
+    Grafo focado apenas nos sites de `BRA`.
+
+    Cada nó à esquerda representa um ponto de branch. À direita aparecem
+    os destinos `taken` e `fallthrough`, com destaque visual para risco de
+    divergência e pressão de memória nos dois caminhos.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("plotly não disponível. Use control_flow(mode='text', view='bra') "
+              "ou instale plotly para o grafo interativo.")
+        return None
+
+    cfg = analyze_control_flow(kernel)
+    sites = cfg.branch_sites[:max_branches]
+    if not sites:
+        print("Nenhum site de BRA encontrado.")
+        return
+    blocks, order = build_cfg(kernel)
+    display_map = _make_block_display_map(blocks, order)
+
+    risk_color = {
+        "none": "#64748b",
+        "low": "#22c55e",
+        "medium": "#f59e0b",
+        "high": "#ef4444",
+    }
+
+    fig = go.Figure()
+    y_values = list(range(len(sites)))[::-1]
+    node_x = []
+    node_y = []
+    node_text = []
+    node_color = []
+    node_label = []
+
+    for idx, site in enumerate(sites):
+        y = y_values[idx]
+        branch_id = f"B{idx + 1}"
+        total_mem = site.taken_memory_ops + site.fallthrough_memory_ops
+        src = f"linha .cu {site.source_line}" if site.source_line > 0 else f"PTX:{site.line_no}"
+        block_name = display_map.get(site.block_label, site.block_label)
+
+        node_x.append(0.0)
+        node_y.append(y)
+        node_label.append(f"{branch_id}\n{site.divergence_risk}")
+        node_color.append(risk_color.get(site.divergence_risk, "#64748b"))
+        node_text.append(
+            f"<b>{branch_id}</b><br>"
+            f"Bloco simplificado: {block_name}<br>"
+            f"Bloco PTX: {site.block_label}<br>"
+            f"Tipo: {site.branch_kind}<br>"
+            f"Origem: {src}<br>"
+            f"Risco de divergência: {site.divergence_risk}<br>"
+            f"Memória nos caminhos: {total_mem}<br>"
+            f"<code>{site.raw}</code>"
+        )
+
+        for lane, (target_label, mem_ops, inst_count, edge_label, edge_color) in enumerate([
+            (site.taken_target, site.taken_memory_ops, site.taken_instruction_count, "taken", "#f59e0b"),
+            (site.fallthrough_target, site.fallthrough_memory_ops, site.fallthrough_instruction_count, "fall", "#94a3b8"),
+        ]):
+            if not target_label:
+                continue
+            tx = 0.95 + lane * 0.7
+            ty = y + (0.16 if lane == 0 else -0.16)
+            target_short = display_map.get(target_label, target_label)
+
+            fig.add_trace(go.Scatter(
+                x=[0.08, tx - 0.06],
+                y=[y, ty],
+                mode="lines",
+                line=dict(color=edge_color, width=2),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+
+            fig.add_annotation(
+                x=tx - 0.06,
+                y=ty,
+                ax=0.08,
+                ay=y,
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=2,
+                arrowcolor=edge_color,
+                text="",
+            )
+
+            node_x.append(tx)
+            node_y.append(ty)
+            node_label.append(
+                f"{'T' if edge_label == 'taken' else 'F'}\nmem {mem_ops} | i {inst_count}"
+            )
+            node_color.append("#1e293b")
+            node_text.append(
+                f"<b>{edge_label}</b><br>"
+                f"Destino simplificado: {target_short}<br>"
+                f"Destino PTX: {target_label}<br>"
+                f"Instruções no bloco: {inst_count}<br>"
+                f"Mem ops no bloco: {mem_ops}"
+            )
+
+    fig.add_trace(go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=node_label,
+        textposition="middle center",
+        textfont=dict(size=10),
+        marker=dict(
+            size=22,
+            color=node_color,
+            line=dict(color="#cbd5e1", width=1),
+        ),
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=node_text,
+        showlegend=False,
+    ))
+
+    fig.add_annotation(x=0.0, y=len(sites) - 0.2, text="branch", showarrow=False, font=dict(size=11, color="#cbd5e1"))
+    fig.add_annotation(x=0.95, y=len(sites) - 0.2, text="taken", showarrow=False, font=dict(size=11, color="#f59e0b"))
+    fig.add_annotation(x=1.65, y=len(sites) - 0.2, text="fallthrough", showarrow=False, font=dict(size=11, color="#94a3b8"))
+
+    fig.update_layout(
+        title=f"Branches Simplificados — {kernel.name}",
+        xaxis=dict(visible=False, range=[-0.25, 1.95]),
+        yaxis=dict(visible=False, range=[-1, len(sites)]),
+        height=max(500, 80 + len(sites) * 44),
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
 def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
     """
     Grouped bar chart: global loads, global stores, shared, local por kernel.
@@ -1015,6 +1193,345 @@ def plot_memory_access_breakdown(kernels: Dict[str, "PTXKernel"]):
         barmode="group",
         xaxis_title="Kernel",
         yaxis_title="Nº de instruções de memória",
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
+def plot_instruction_roofline(kernels: Dict[str, "PTXKernel"],
+                              peak_ipc: float = 128.0,
+                              mem_ceiling: float = 32.0):
+    """
+    Roofline estático em espaço de instrução:
+      X = instruction intensity (instruções / acessos de memória)
+      Y = throughput estimado de instruções (proxy estático)
+    """
+    import math
+    import plotly.graph_objects as go
+
+    ridge = peak_ipc / max(mem_ceiling, 1e-6)
+    xs = [0.1, ridge, ridge * 100]
+    ys = [mem_ceiling * xs[0], peak_ipc, peak_ipc]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys,
+        mode="lines",
+        line=dict(color="#94a3b8", width=2, dash="dash"),
+        name="Instruction Roofline",
+        hovertemplate="Roofline estático<extra></extra>",
+    ))
+    fig.add_vline(x=ridge, line=dict(color="#475569", dash="dot", width=1))
+    fig.add_annotation(
+        x=math.log10(ridge), y=0.95, xref="x", yref="paper",
+        text=f"Ridge ≈ {ridge:.2f} instr/mem",
+        showarrow=False, font=dict(color="#64748b", size=11),
+        xanchor="left",
+    )
+
+    palette = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b",
+               "#8b5cf6", "#ec4899", "#06b6d4", "#f97316"]
+
+    for idx, (name, kernel) in enumerate(kernels.items()):
+        ii = max(kernel.instruction_intensity, 0.1)
+        throughput = min(peak_ipc, mem_ceiling * ii)
+        region = "memory-bound" if ii < ridge else "compute-bound"
+        fig.add_trace(go.Scatter(
+            x=[ii], y=[throughput],
+            mode="markers+text",
+            marker=dict(size=14, color=palette[idx % len(palette)],
+                        line=dict(color="white", width=1)),
+            text=[name],
+            textposition="top center",
+            textfont=dict(size=11),
+            name=name,
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                f"Instruction intensity: {ii:.2f}<br>"
+                f"Arithmetic ratio: {kernel.arithmetic_ratio:.1%}<br>"
+                f"Throughput est.: {throughput:.1f}<br>"
+                f"Região: {region}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        title="Instruction Roofline — Espaço Estático de Instruções",
+        xaxis=dict(title="Instruction intensity (instr / mem-access)",
+                   type="log", gridcolor="#1e293b"),
+        yaxis=dict(title="Instruction throughput estimado",
+                   type="log", gridcolor="#1e293b"),
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
+def _kmeans(points, k=3, iterations=20):
+    import math
+
+    if not points:
+        return []
+    k = max(1, min(k, len(points)))
+    centers = [list(points[i]) for i in range(k)]
+    labels = [0] * len(points)
+
+    def dist2(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b))
+
+    for _ in range(iterations):
+        changed = False
+        for idx, point in enumerate(points):
+            best = min(range(k), key=lambda c: dist2(point, centers[c]))
+            if labels[idx] != best:
+                labels[idx] = best
+                changed = True
+
+        new_centers = []
+        for cid in range(k):
+            members = [points[i] for i, lbl in enumerate(labels) if lbl == cid]
+            if not members:
+                new_centers.append(centers[cid])
+                continue
+            dims = len(members[0])
+            new_centers.append([
+                sum(p[d] for p in members) / len(members) for d in range(dims)
+            ])
+        centers = new_centers
+        if not changed:
+            break
+    return labels
+
+
+def plot_metric_space_pca(kernels: Dict[str, "PTXKernel"]):
+    """
+    PCA 2D dos kernels no espaço de métricas, com clustering simples.
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+
+    names = list(kernels.keys())
+    if len(names) < 2:
+        print("PCA requer pelo menos 2 kernels.")
+        return
+
+    metric_names = [
+        "total_instructions",
+        "registers_per_thread",
+        "branch_ratio",
+        "instruction_intensity",
+        "arithmetic_ratio",
+        "shared_accesses",
+        "local_accesses",
+        "basic_block_count",
+        "cfg_loop_count",
+        "coalescing_est",
+        "simd_utilization_est",
+    ]
+    data = np.array([
+        [float(getattr(kernels[name], metric)) for metric in metric_names]
+        for name in names
+    ], dtype=float)
+
+    means = data.mean(axis=0)
+    stds = data.std(axis=0)
+    stds[stds == 0] = 1.0
+    z = (data - means) / stds
+
+    cov = np.cov(z, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    coords = z @ eigvecs[:, :2]
+    explained = eigvals / max(eigvals.sum(), 1e-9)
+    labels = _kmeans(coords.tolist(), k=min(3, len(names)))
+
+    palette = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6"]
+    fig = go.Figure()
+    for idx, name in enumerate(names):
+        kernel = kernels[name]
+        fig.add_trace(go.Scatter(
+            x=[coords[idx, 0]], y=[coords[idx, 1]],
+            mode="markers+text",
+            marker=dict(size=14,
+                        color=palette[labels[idx] % len(palette)],
+                        line=dict(color="white", width=1)),
+            text=[name],
+            textposition="top center",
+            name=f"cluster {labels[idx] + 1}",
+            legendgroup=f"cluster-{labels[idx]}",
+            showlegend=False,
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                f"Cluster: {labels[idx] + 1}<br>"
+                f"Instr: {kernel.total_instructions}<br>"
+                f"Regs/thread: {kernel.registers_per_thread}<br>"
+                f"Branch eff.: {kernel.branch_efficiency:.1%}<br>"
+                f"II: {kernel.instruction_intensity:.2f}<extra></extra>"
+            ),
+        ))
+
+    for cid in sorted(set(labels)):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=12, color=palette[cid % len(palette)]),
+            name=f"Cluster {cid + 1}",
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        title="PCA / Clustering dos Sorts no Espaço de Métricas",
+        xaxis_title=f"PC1 ({explained[0] * 100:.1f}% var.)",
+        yaxis_title=f"PC2 ({explained[1] * 100:.1f}% var.)" if len(explained) > 1 else "PC2",
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
+def plot_branch_efficiency_registers(kernels: Dict[str, "PTXKernel"]):
+    """
+    Barras comparando branch efficiency estimada e registradores por thread.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    names = list(kernels.keys())
+    branch_eff = [k.branch_efficiency * 100 for k in kernels.values()]
+    regs = [k.registers_per_thread for k in kernels.values()]
+
+    fig = make_subplots(rows=1, cols=2, subplot_titles=(
+        "Branch Efficiency Estimada",
+        "Registradores por Thread",
+    ))
+    fig.add_trace(go.Bar(
+        x=names, y=branch_eff, marker_color="#10b981",
+        hovertemplate="<b>%{x}</b><br>Branch efficiency: %{y:.1f}%<extra></extra>",
+        name="Branch efficiency",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=names, y=regs, marker_color="#f59e0b",
+        hovertemplate="<b>%{x}</b><br>Regs/thread: %{y}<extra></extra>",
+        name="Regs/thread",
+    ), row=1, col=2)
+    fig.update_yaxes(title_text="%", row=1, col=1)
+    fig.update_yaxes(title_text="Registradores", row=1, col=2)
+    fig.update_layout(
+        title="Branches e Pressão de Registradores por Kernel",
+        showlegend=False,
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
+def plot_memory_hierarchy(kernel: PTXKernel):
+    """
+    Diagrama estático da hierarquia de memória com métricas sobrepostas.
+    """
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    levels = [
+        ("Registers", kernel.registers_per_thread, "#10b981", 0, 0, 3.8, 0.9),
+        ("Shared", kernel.shared_accesses, "#3b82f6", 0.3, -1.3, 3.2, 0.9),
+        ("Local", kernel.local_accesses, "#8b5cf6", 0.6, -2.6, 2.6, 0.9),
+        ("Global", kernel.global_loads + kernel.global_stores, "#ef4444", 0.9, -3.9, 2.0, 0.9),
+    ]
+
+    for label, value, color, x, y, w, h in levels:
+        fig.add_shape(
+            type="rect", x0=x, y0=y, x1=x + w, y1=y + h,
+            fillcolor=color, opacity=0.25,
+            line=dict(color=color, width=2),
+        )
+        fig.add_annotation(
+            x=x + w / 2, y=y + h / 2,
+            text=f"<b>{label}</b><br>{value}",
+            showarrow=False,
+            font=dict(size=14, color="#f1f5f9"),
+        )
+
+    fig.add_annotation(
+        x=2.0, y=1.0,
+        text=(
+            f"<b>{kernel.name}</b><br>"
+            f"bar.sync: {kernel.bar_sync_count}<br>"
+            f"coalescência est.: {kernel.coalescing_est:.1%}<br>"
+            f"SIMD est.: {kernel.simd_utilization_est:.1%}"
+        ),
+        showarrow=False,
+        align="left",
+        font=dict(size=12, color="#cbd5e1"),
+        bordercolor="#334155",
+        borderwidth=1,
+        bgcolor="#111a1e",
+    )
+
+    fig.update_layout(
+        title="Hierarquia de Memória com Métricas Sobrepostas",
+        xaxis=dict(visible=False, range=[-0.2, 4.3]),
+        yaxis=dict(visible=False, range=[-4.8, 1.7]),
+        height=650,
+        **_DARK_LAYOUT,
+    )
+    _show_fig(fig)
+    return fig
+
+
+def plot_runtime_curves(runtime_profile):
+    """
+    Curvas de tempo e sorting-rate por tamanho e distribuição de entrada.
+    """
+    import re
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    dist_re = re.compile(r"(?:dist|distribution)=([A-Za-z0-9_-]+)")
+    grouped = {}
+    for label, bench in runtime_profile.benchmarks.items():
+        for sample in bench.samples:
+            match = dist_re.search(sample.extra or "")
+            dist = match.group(1) if match else "default"
+            key = (label, dist)
+            grouped.setdefault(key, []).append(sample)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Tempo por Tamanho", "Sorting Rate por Tamanho"),
+    )
+    palette = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b",
+               "#8b5cf6", "#ec4899", "#06b6d4", "#f97316"]
+
+    for idx, ((label, dist), samples) in enumerate(sorted(grouped.items())):
+        by_n = {}
+        for sample in samples:
+            by_n.setdefault(sample.n, []).append(sample.milliseconds)
+        xs = sorted(by_n)
+        ys = [sum(by_n[n]) / len(by_n[n]) for n in xs]
+        rates = [n / max(ms, 1e-9) for n, ms in zip(xs, ys)]
+        color = palette[idx % len(palette)]
+        name = f"{label} [{dist}]"
+
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines+markers",
+            line=dict(color=color), name=name,
+            hovertemplate="<b>%{x}</b><br>tempo: %{y:.3f} ms<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=xs, y=rates, mode="lines+markers",
+            line=dict(color=color), name=name, showlegend=False,
+            hovertemplate="<b>%{x}</b><br>rate: %{y:.3f} elem/ms<extra></extra>",
+        ), row=1, col=2)
+
+    fig.update_xaxes(title_text="Tamanho de entrada (N)", type="log", row=1, col=1)
+    fig.update_xaxes(title_text="Tamanho de entrada (N)", type="log", row=1, col=2)
+    fig.update_yaxes(title_text="Tempo (ms)", row=1, col=1)
+    fig.update_yaxes(title_text="Sorting rate (elem/ms)", row=1, col=2)
+    fig.update_layout(
+        title="Curvas de Runtime por Tamanho e Distribuição",
+        legend=dict(orientation="h", y=-0.18),
         **_DARK_LAYOUT,
     )
     _show_fig(fig)

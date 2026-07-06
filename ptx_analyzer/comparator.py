@@ -4,7 +4,14 @@ Classe PTXComparator para comparar múltiplos kernels.
 
 from typing import Dict, List
 from .analyzer import PTXAnalyzer, _bar, _section
-from .visuals import plot_instruction_mix_stacked, plot_memory_access_breakdown, plot_roofline
+from .visuals import (
+    plot_instruction_mix_stacked,
+    plot_memory_access_breakdown,
+    plot_roofline,
+    plot_instruction_roofline,
+    plot_metric_space_pca,
+    plot_branch_efficiency_registers,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 8. PTXComparator — análise de múltiplos kernels
@@ -226,6 +233,99 @@ class PTXComparator:
                 row += f"  {str(vals[m]):>10}"
             print(row)
 
+    def flowcharts(self,
+                   mode: str = "html",
+                   max_decisions: int = 0,
+                   columns: int = 3):
+        """
+        Exibe os fluxogramas Mermaid de todos os kernels adicionados.
+
+        Args:
+            mode:
+                - "html": mostra lado a lado no notebook
+                - "raw": retorna um dict {nome: mermaid}
+                - "text": imprime um após o outro em texto
+            max_decisions: limite de BRAs relevantes por kernel (0 = todos)
+            columns: número de colunas no layout HTML
+        """
+        mode = mode.lower()
+        if not self._order:
+            if mode == "raw":
+                return {}
+            print("Nenhum kernel adicionado.")
+            return None
+
+        graphs = {
+            name: self._analyzers[name].flowchart(mode="raw", max_decisions=max_decisions)
+            for name in self._order
+        }
+
+        if mode == "raw":
+            return graphs
+
+        if mode == "text":
+            for name in self._order:
+                print(f"\n### {name}\n")
+                print(graphs[name])
+            return graphs
+
+        try:
+            from IPython.display import Markdown, display
+            import ipywidgets as w
+        except Exception:
+            for name in self._order:
+                print(f"\n### {name}\n")
+                print(graphs[name])
+            return graphs
+
+        cards = []
+        cols = max(1, int(columns))
+        width = f"{100 / cols:.2f}%"
+
+        for name in self._order:
+            title = w.HTML(
+                value=(
+                    "<div style='font-family:system-ui,sans-serif;"
+                    "font-size:14px;font-weight:700;color:#0f172a;"
+                    "padding:8px 10px;border-bottom:1px solid #dbe4f0;'>"
+                    f"{name}</div>"
+                )
+            )
+            out = w.Output(
+                layout=w.Layout(
+                    width="100%",
+                    min_height="420px",
+                    overflow="auto",
+                    padding="8px 10px 12px 10px",
+                )
+            )
+            with out:
+                display(Markdown(f"```mermaid\n{graphs[name].rstrip()}\n```"))
+            cards.append(
+                w.VBox(
+                    [title, out],
+                    layout=w.Layout(
+                        width=width,
+                        border="1px solid #cbd5e1",
+                        border_radius="10px",
+                        background_color="#ffffff",
+                        margin="6px",
+                    ),
+                )
+            )
+
+        grid = w.Box(
+            cards,
+            layout=w.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                align_items="stretch",
+                width="100%",
+            ),
+        )
+        display(grid)
+        return graphs
+
     # ── gráficos ─────────────────────────────────────────────────────────────
 
     def plot_comparison(self, *metrics: str):
@@ -234,7 +334,7 @@ class PTXComparator:
         from .visuals import _DARK_LAYOUT, _show_fig
 
         if not metrics:
-            metrics = ("Instruções", "Branches", "ld.global", "Registradores")
+            metrics = ("Instruções", "BranchTotal", "ld.global", "Regs/Thread")
 
         table = self._metrics()
         names = self._order
@@ -264,8 +364,8 @@ class PTXComparator:
         from .visuals import _DARK_LAYOUT, _show_fig
 
         radar_metrics = [
-            "Instruções", "Registradores", "ld.global",
-            "Branches", "Int.Aritmética", "shfl.sync",
+            "Instruções", "Regs/Thread", "ld.global",
+            "BranchCondicional", "InstructionIntensity", "shfl.sync",
         ]
         table = self._metrics()
         names = self._order
@@ -328,11 +428,31 @@ class PTXComparator:
             peak_flops, peak_bw,
         )
 
+    def plot_instruction_roofline(self, peak_ipc: float = 128.0, mem_ceiling: float = 32.0):
+        """Instruction Roofline estático para todos os kernels."""
+        plot_instruction_roofline(
+            {n: self._analyzers[n].kernel for n in self._order},
+            peak_ipc, mem_ceiling,
+        )
+
+    def plot_metric_space(self):
+        """PCA/clustering dos kernels no espaço de métricas."""
+        plot_metric_space_pca(
+            {n: self._analyzers[n].kernel for n in self._order}
+        )
+
+    def plot_branch_registers(self):
+        """Barras de branch efficiency e registradores por thread."""
+        plot_branch_efficiency_registers(
+            {n: self._analyzers[n].kernel for n in self._order}
+        )
+
     def generate_report_table(self) -> str:
         """Retorna tabela Markdown comparativa para incluir no relatório."""
         table = self._metrics()
-        cols = ["Instruções", "Registradores", "ld.global", "ld/st.local",
-                "Branches", "BranchRatio", "Int.Aritmética", "SóRegistros"]
+        cols = ["Instruções", "Regs/Thread", "ld.global", "Shared", "ld/st.local",
+                "BranchCondicional", "BranchEfficiency", "InstructionIntensity",
+                "ArithmeticRatio", "BasicBlocks", "CFGLoops", "SóRegistros"]
         header = "| Algoritmo | " + " | ".join(cols) + " |"
         sep    = "|" + "|".join(["---"] * (len(cols) + 1)) + "|"
         rows = []
