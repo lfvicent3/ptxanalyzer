@@ -67,55 +67,91 @@ def mermaid_block_html(graph: str,
             + html.escape(title)
             + "</div>"
         )
+    iframe_doc = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body {{
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #111827;
+      font-family: system-ui, sans-serif;
+    }}
+    #container {{
+      padding: 8px 10px 12px 10px;
+      min-height: {min_height};
+      overflow: auto;
+      box-sizing: border-box;
+    }}
+    pre {{
+      white-space: pre-wrap;
+      background: #fff7ed;
+      color: #7c2d12;
+      padding: 12px;
+      border-radius: 8px;
+      overflow: auto;
+      font-family: ui-monospace, Consolas, 'Courier New', monospace;
+    }}
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    const container = document.getElementById("container");
+    const graph = {graph_json};
+    const escapeHtml = (text) => text.replace(/[&<>]/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+    const showFallback = (message) => {{
+      container.innerHTML =
+        '<pre>' + escapeHtml(message) + '\\n\\n' + escapeHtml(graph) + '</pre>';
+    }};
+    try {{
+      if (!window.mermaid) {{
+        showFallback('Mermaid nao carregou no Colab.');
+      }} else {{
+        mermaid.initialize({{
+          startOnLoad: false,
+          theme: 'base',
+          securityLevel: 'loose',
+          flowchart: {{ useMaxWidth: true, htmlLabels: true, curve: 'basis' }},
+          themeVariables: {{
+            primaryColor: '#ffffff',
+            primaryTextColor: '#111827',
+            primaryBorderColor: '#60a5fa',
+            lineColor: '#2563eb',
+            secondaryColor: '#f8fafc',
+            tertiaryColor: '#fff7ed',
+            background: '#ffffff',
+            mainBkg: '#ffffff',
+            clusterBkg: '#f8fafc',
+            clusterBorder: '#94a3b8',
+            edgeLabelBackground: '#ffffff'
+          }}
+        }});
+        mermaid.render('{graph_id}-svg', graph).then((result) => {{
+          container.innerHTML = result.svg;
+        }}).catch((err) => {{
+          showFallback('Falha ao renderizar Mermaid: ' + String(err));
+          console.error('ptx_analyzer mermaid render error', err);
+        }});
+      }}
+    }} catch (err) {{
+      showFallback('Falha ao inicializar Mermaid: ' + String(err));
+      console.error('ptx_analyzer mermaid init error', err);
+    }}
+  </script>
+</body>
+</html>"""
+    iframe_srcdoc = html.escape(iframe_doc, quote=True)
 
     return (
         "<div style='border:1px solid #cbd5e1;border-radius:10px;"
         "background:#ffffff;overflow:hidden;margin:6px;'>"
         + title_html +
-        f"<div id='{graph_id}' style='padding:8px 10px 12px 10px;"
-        f"overflow:auto;min-height:{min_height};'></div>"
-        "<script type='module'>"
-        "const container = document.getElementById("
-        + json.dumps(graph_id)
-        + ");"
-        f"const graph = {graph_json};"
-        "const render = async () => {"
-        "  try {"
-        "    const mermaidMod = await import('https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs');"
-        "    const mermaid = mermaidMod.default ?? mermaidMod;"
-        "    mermaid.initialize({"
-        "      startOnLoad:false,"
-        "      theme:'base',"
-        "      securityLevel:'loose',"
-        "      flowchart:{ useMaxWidth:true, htmlLabels:true, curve:'basis' },"
-        "      themeVariables:{"
-        "        primaryColor:'#ffffff',"
-        "        primaryTextColor:'#111827',"
-        "        primaryBorderColor:'#60a5fa',"
-        "        lineColor:'#2563eb',"
-        "        secondaryColor:'#f8fafc',"
-        "        tertiaryColor:'#fff7ed',"
-        "        background:'#ffffff',"
-        "        mainBkg:'#ffffff',"
-        "        clusterBkg:'#f8fafc',"
-        "        clusterBorder:'#94a3b8',"
-        "        edgeLabelBackground:'#ffffff'"
-        "      }"
-        "    });"
-        "    const { svg } = await mermaid.render("
-        + json.dumps(graph_id + "-svg")
-        + ", graph);"
-        "    container.innerHTML = svg;"
-        "  } catch (err) {"
-        "    container.innerHTML = "
-        "      '<pre style=\"white-space:pre-wrap;background:#fff7ed;color:#7c2d12;"
-        "padding:12px;border-radius:8px;overflow:auto\">Falha ao renderizar Mermaid.\\n\\n'"
-        "      + graph.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))"
-        "      + '</pre>';"
-        "    console.error('ptx_analyzer mermaid render error', err);"
-        "  }"
-        "};"
-        "render();"
-        "</script>"
+        f"<iframe sandbox='allow-scripts allow-same-origin' "
+        f"style='width:100%;border:0;min-height:{min_height};background:#ffffff;' "
+        f"srcdoc=\"{iframe_srcdoc}\"></iframe>"
         "</div>"
     )
