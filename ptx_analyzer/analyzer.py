@@ -96,7 +96,11 @@ class PTXAnalyzer:
     # ── construtores alternativos ────────────────────────────────────────────
 
     @classmethod
-    def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXAnalyzer":
+    def from_file(cls,
+                  path: str,
+                  kernel_index: int = 0,
+                  arch: str = "sm_75",
+                  verbose: bool = False) -> "PTXAnalyzer":
         import subprocess, os, re
 
         if path.endswith(".cu"):
@@ -107,7 +111,8 @@ class PTXAnalyzer:
                 "--ptxas-options=-v",
                 path, f"-arch={arch}", "-o", out_ptx,
             ]
-            print(f"Compilando CUDA para PTX: {' '.join(cmd)}")
+            if verbose:
+                print(f"Compilando CUDA para PTX: {' '.join(cmd)}")
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode != 0:
                 raise RuntimeError(f"Erro ao compilar {path}:\n{res.stderr}")
@@ -115,7 +120,7 @@ class PTXAnalyzer:
             # Exibir info do ptxas (vai para stderr mesmo com sucesso)
             ptxas_info = [ln for ln in res.stderr.splitlines()
                           if ln.strip().startswith("ptxas")]
-            if ptxas_info:
+            if verbose and ptxas_info:
                 print("\n── Informações ptxas (--ptxas-options=-v) ──")
                 for ln in ptxas_info:
                     print(" ", ln)
@@ -147,13 +152,15 @@ class PTXAnalyzer:
             for d in search_dirs:
                 candidate = os.path.normpath(os.path.join(d, f"{stem}.cu"))
                 if os.path.exists(candidate):
-                    print(f"[ptx_analyzer] PTX sem lineinfo → tentando recompilar "
-                          f"{os.path.basename(candidate)} com -lineinfo")
+                    if verbose:
+                        print(f"[ptx_analyzer] PTX sem lineinfo → tentando recompilar "
+                              f"{os.path.basename(candidate)} com -lineinfo")
                     try:
-                        return cls.from_file(candidate, kernel_index, arch)
+                        return cls.from_file(candidate, kernel_index, arch, verbose=verbose)
                     except Exception as exc:
-                        print(f"[ptx_analyzer] aviso: recompilação falhou, usando PTX existente sem lineinfo.\n"
-                              f"  motivo: {exc}")
+                        if verbose:
+                            print(f"[ptx_analyzer] aviso: recompilação falhou, usando PTX existente sem lineinfo.\n"
+                                  f"  motivo: {exc}")
                         break
 
         analyzer = cls(code, kernel_index)
@@ -1012,7 +1019,7 @@ class PTXAnalyzer:
             try:
                 from IPython.display import HTML, display
                 display(HTML(mermaid_block_html(graph, title=self.kernel.name)))
-                return graph
+                return None
             except Exception:
                 return emit_text(self._format_mermaid_fence(max_decisions=max_decisions), mode="text")
         if mode in ("text", "html", "raw"):

@@ -103,7 +103,11 @@ class PTXSourceView:
         return cls(cu, kernels[idx])
 
     @classmethod
-    def from_file(cls, path: str, kernel_index: int = 0, arch: str = "sm_75") -> "PTXSourceView":
+    def from_file(cls,
+                  path: str,
+                  kernel_index: int = 0,
+                  arch: str = "sm_75",
+                  verbose: bool = False) -> "PTXSourceView":
         """
         Recebe um arquivo .cu, compila com -lineinfo automaticamente e abre a vista.
         """
@@ -115,7 +119,8 @@ class PTXSourceView:
         
         out_ptx = path.replace(".cu", ".ptx")
         cmd = ["nvcc", "-ptx", "-lineinfo", path, f"-arch={arch}", "-o", out_ptx]
-        print(f"Compilando CUDA para PTX (com -lineinfo): {' '.join(cmd)}")
+        if verbose:
+            print(f"Compilando CUDA para PTX (com -lineinfo): {' '.join(cmd)}")
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"Erro ao compilar {path}:\n{res.stderr}")

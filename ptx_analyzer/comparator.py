@@ -296,7 +296,7 @@ class PTXComparator:
             + "</div>"
         )
         display(HTML(grid_html))
-        return graphs
+        return None
 
     # ── gráficos ─────────────────────────────────────────────────────────────
 

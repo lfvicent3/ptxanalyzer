@@ -52,7 +52,7 @@ def emit_text(text: str, mode: str = "text"):
 
 def mermaid_block_html(graph: str,
                        title: str | None = None,
-                       min_height: str = "420px") -> str:
+                       min_height: str = "720px") -> str:
     """
     Retorna um bloco HTML autocontido para renderizar Mermaid em Jupyter/Colab.
     """
