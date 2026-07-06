@@ -52,7 +52,7 @@ def emit_text(text: str, mode: str = "text"):
 
 def mermaid_block_html(graph: str,
                        title: str | None = None,
-                       min_height: str = "720px") -> str:
+                       min_height: str = "420px") -> str:
     """
     Retorna um bloco HTML autocontido para renderizar Mermaid em Jupyter/Colab.
     """
@@ -102,10 +102,25 @@ def mermaid_block_html(graph: str,
   <script>
     const container = document.getElementById("container");
     const graph = {graph_json};
+    const frameId = {json.dumps(graph_id)};
     const escapeHtml = (text) => text.replace(/[&<>]/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+    const notifyParent = () => {{
+      try {{
+        const body = document.body;
+        const html = document.documentElement;
+        const height = Math.max(
+          body.scrollHeight, body.offsetHeight,
+          html.clientHeight, html.scrollHeight, html.offsetHeight
+        );
+        parent.postMessage({{ type: 'ptx-mermaid-resize', frameId, height }}, '*');
+      }} catch (err) {{
+        console.error('ptx_analyzer resize notify error', err);
+      }}
+    }};
     const showFallback = (message) => {{
       container.innerHTML =
         '<pre>' + escapeHtml(message) + '\\n\\n' + escapeHtml(graph) + '</pre>';
+      notifyParent();
     }};
     try {{
       if (!window.mermaid) {{
@@ -132,6 +147,12 @@ def mermaid_block_html(graph: str,
         }});
         mermaid.render('{graph_id}-svg', graph).then((result) => {{
           container.innerHTML = result.svg;
+          notifyParent();
+          if (window.ResizeObserver) {{
+            const ro = new ResizeObserver(() => notifyParent());
+            ro.observe(container);
+          }}
+          window.addEventListener('load', notifyParent);
         }}).catch((err) => {{
           showFallback('Falha ao renderizar Mermaid: ' + String(err));
           console.error('ptx_analyzer mermaid render error', err);
@@ -150,8 +171,23 @@ def mermaid_block_html(graph: str,
         "<div style='border:1px solid #cbd5e1;border-radius:10px;"
         "background:#ffffff;overflow:hidden;margin:6px;'>"
         + title_html +
-        f"<iframe sandbox='allow-scripts allow-same-origin' "
-        f"style='width:100%;border:0;min-height:{min_height};background:#ffffff;' "
+        f"<iframe id='{graph_id}' sandbox='allow-scripts allow-same-origin' "
+        f"style='width:100%;border:0;height:{min_height};background:#ffffff;' "
         f"srcdoc=\"{iframe_srcdoc}\"></iframe>"
+        "<script>"
+        "(function(){"
+        "  const frameId = " + json.dumps(graph_id) + ";"
+        "  const iframe = document.getElementById(frameId);"
+        "  if (!iframe) return;"
+        "  const minHeight = " + json.dumps(min_height) + ";"
+        "  const onMessage = (event) => {"
+        "    const data = event.data || {};"
+        "    if (data.type !== 'ptx-mermaid-resize' || data.frameId !== frameId) return;"
+        "    const h = Math.max(parseInt(minHeight, 10) || 0, Number(data.height) || 0);"
+        "    iframe.style.height = h + 'px';"
+        "  };"
+        "  window.addEventListener('message', onMessage);"
+        "})();"
+        "</script>"
         "</div>"
     )
