@@ -9,7 +9,7 @@ from .core import PTXKernel, CATEGORIES, analyze_control_flow, build_cfg
 from .parser import parse_ptx
 from .heuristics import run_heuristics, LEVEL_ICONS
 from .runtime import RuntimeProfile, profile_cuda_runtime
-from .output import emit_text
+from .output import emit_text, mermaid_block_html
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers de saída em texto
@@ -1008,13 +1008,13 @@ class PTXAnalyzer:
                 return _plot_bra_graph(self.kernel, max_branches)
             return _plot_branch_cfg(self.kernel, max_blocks)
         if view == "mermaid" and mode == "html":
-            fence = self._format_mermaid_fence(max_decisions=max_decisions)
+            graph = self._format_mermaid_text(max_decisions=max_decisions)
             try:
-                from IPython.display import Markdown, display
-                display(Markdown(fence))
-                return fence
+                from IPython.display import HTML, display
+                display(HTML(mermaid_block_html(graph, title=self.kernel.name)))
+                return graph
             except Exception:
-                return emit_text(fence, mode="text")
+                return emit_text(self._format_mermaid_fence(max_decisions=max_decisions), mode="text")
         if mode in ("text", "html", "raw"):
             if view == "mermaid":
                 if mode == "text":

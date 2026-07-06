@@ -5,6 +5,8 @@ Helpers de saída padronizada para texto / HTML / widget.
 from __future__ import annotations
 
 import html
+import json
+import uuid
 
 
 def preformatted_html(text: str) -> str:
@@ -47,3 +49,73 @@ def emit_text(text: str, mode: str = "text"):
     print(text, end="" if text.endswith("\n") else "\n")
     return text
 
+
+def mermaid_block_html(graph: str,
+                       title: str | None = None,
+                       min_height: str = "420px") -> str:
+    """
+    Retorna um bloco HTML autocontido para renderizar Mermaid em Jupyter/Colab.
+    """
+    graph_id = f"ptx-mermaid-{uuid.uuid4().hex}"
+    graph_json = json.dumps(graph)
+    title_html = ""
+    if title:
+        title_html = (
+            "<div style='font-family:system-ui,sans-serif;font-size:14px;"
+            "font-weight:700;color:#0f172a;padding:8px 10px;"
+            "border-bottom:1px solid #dbe4f0;'>"
+            + html.escape(title)
+            + "</div>"
+        )
+
+    return (
+        "<div style='border:1px solid #cbd5e1;border-radius:10px;"
+        "background:#ffffff;overflow:hidden;margin:6px;'>"
+        + title_html +
+        f"<div id='{graph_id}' style='padding:8px 10px 12px 10px;"
+        f"overflow:auto;min-height:{min_height};'></div>"
+        "<script type='module'>"
+        "const container = document.getElementById("
+        + json.dumps(graph_id)
+        + ");"
+        f"const graph = {graph_json};"
+        "const render = async () => {"
+        "  try {"
+        "    const mermaidMod = await import('https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs');"
+        "    const mermaid = mermaidMod.default ?? mermaidMod;"
+        "    mermaid.initialize({"
+        "      startOnLoad:false,"
+        "      theme:'base',"
+        "      securityLevel:'loose',"
+        "      flowchart:{ useMaxWidth:true, htmlLabels:true, curve:'basis' },"
+        "      themeVariables:{"
+        "        primaryColor:'#ffffff',"
+        "        primaryTextColor:'#111827',"
+        "        primaryBorderColor:'#60a5fa',"
+        "        lineColor:'#2563eb',"
+        "        secondaryColor:'#f8fafc',"
+        "        tertiaryColor:'#fff7ed',"
+        "        background:'#ffffff',"
+        "        mainBkg:'#ffffff',"
+        "        clusterBkg:'#f8fafc',"
+        "        clusterBorder:'#94a3b8',"
+        "        edgeLabelBackground:'#ffffff'"
+        "      }"
+        "    });"
+        "    const { svg } = await mermaid.render("
+        + json.dumps(graph_id + "-svg")
+        + ", graph);"
+        "    container.innerHTML = svg;"
+        "  } catch (err) {"
+        "    container.innerHTML = "
+        "      '<pre style=\"white-space:pre-wrap;background:#fff7ed;color:#7c2d12;"
+        "padding:12px;border-radius:8px;overflow:auto\">Falha ao renderizar Mermaid.\\n\\n'"
+        "      + graph.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))"
+        "      + '</pre>';"
+        "    console.error('ptx_analyzer mermaid render error', err);"
+        "  }"
+        "};"
+        "render();"
+        "</script>"
+        "</div>"
+    )

@@ -4,6 +4,7 @@ Classe PTXComparator para comparar múltiplos kernels.
 
 from typing import Dict, List
 from .analyzer import PTXAnalyzer, _bar, _section
+from .output import mermaid_block_html
 from .visuals import (
     plot_instruction_mix_stacked,
     plot_memory_access_breakdown,
@@ -270,60 +271,31 @@ class PTXComparator:
             return graphs
 
         try:
-            from IPython.display import Markdown, display
-            import ipywidgets as w
+            from IPython.display import HTML, display
         except Exception:
             for name in self._order:
                 print(f"\n### {name}\n")
                 print(graphs[name])
             return graphs
 
-        cards = []
         cols = max(1, int(columns))
-        width = f"{100 / cols:.2f}%"
-
+        card_width = f"calc({100 / cols:.2f}% - 12px)"
+        html_cards = []
         for name in self._order:
-            title = w.HTML(
-                value=(
-                    "<div style='font-family:system-ui,sans-serif;"
-                    "font-size:14px;font-weight:700;color:#0f172a;"
-                    "padding:8px 10px;border-bottom:1px solid #dbe4f0;'>"
-                    f"{name}</div>"
-                )
+            html_cards.append(
+                "<div style='flex:0 0 "
+                + card_width
+                + ";min-width:340px;'>"
+                + mermaid_block_html(graphs[name], title=name)
+                + "</div>"
             )
-            out = w.Output(
-                layout=w.Layout(
-                    width="100%",
-                    min_height="420px",
-                    overflow="auto",
-                    padding="8px 10px 12px 10px",
-                )
-            )
-            with out:
-                display(Markdown(f"```mermaid\n{graphs[name].rstrip()}\n```"))
-            cards.append(
-                w.VBox(
-                    [title, out],
-                    layout=w.Layout(
-                        width=width,
-                        border="1px solid #cbd5e1",
-                        border_radius="10px",
-                        background_color="#ffffff",
-                        margin="6px",
-                    ),
-                )
-            )
-
-        grid = w.Box(
-            cards,
-            layout=w.Layout(
-                display="flex",
-                flex_flow="row wrap",
-                align_items="stretch",
-                width="100%",
-            ),
+        grid_html = (
+            "<div style='display:flex;flex-wrap:wrap;align-items:flex-start;"
+            "gap:0;width:100%;'>"
+            + "".join(html_cards)
+            + "</div>"
         )
-        display(grid)
+        display(HTML(grid_html))
         return graphs
 
     # ── gráficos ─────────────────────────────────────────────────────────────
