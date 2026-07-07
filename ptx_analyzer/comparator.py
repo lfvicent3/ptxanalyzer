@@ -282,11 +282,29 @@ class PTXComparator:
         card_width = f"calc({100 / cols:.2f}% - 12px)"
         html_cards = []
         for name in self._order:
+            analyzer = self._analyzers[name]
+            graph_payload = graphs[name]
+            src_path = analyzer._infer_source_path()
+            if src_path:
+                try:
+                    with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+                        source_lines = f.read().splitlines()
+                    if any(instr.source_line > 0 for instr in analyzer.kernel.instructions):
+                        graph_payload = {
+                            "ptx": graphs[name],
+                            "source": analyzer._format_mermaid_text(
+                                max_decisions=max_decisions,
+                                label_mode="source",
+                                source_lines=source_lines,
+                            ),
+                        }
+                except Exception:
+                    pass
             html_cards.append(
                 "<div style='flex:0 0 "
                 + card_width
                 + ";min-width:340px;'>"
-                + mermaid_block_html(graphs[name], title=name)
+                + mermaid_block_html(graph_payload, title=name)
                 + "</div>"
             )
         grid_html = (

@@ -94,16 +94,128 @@ def mermaid_block_html(graph: str,
       overflow: auto;
       font-family: ui-monospace, Consolas, 'Courier New', monospace;
     }}
+    #toolbar {{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.96);
+      border-bottom: 1px solid #dbe4f0;
+      backdrop-filter: blur(3px);
+    }}
+    #toolbar button {{
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #0f172a;
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1.2;
+    }}
+    #toolbar button:hover {{
+      background: #f8fafc;
+    }}
+    #zoom-label {{
+      font-size: 12px;
+      color: #475569;
+      min-width: 52px;
+      text-align: center;
+    }}
+    #viewport {{
+      overflow: auto;
+      padding: 8px 10px 12px 10px;
+      min-height: {min_height};
+      box-sizing: border-box;
+      outline: none;
+      cursor: grab;
+    }}
+    #viewport.dragging {{
+      cursor: grabbing;
+      user-select: none;
+    }}
+    #stage {{
+      width: max-content;
+      transform-origin: top left;
+    }}
   </style>
 </head>
 <body>
-  <div id="container"></div>
+  <div id="toolbar">
+    <button id="zoom-out" type="button">-</button>
+    <div id="zoom-label">100%</div>
+    <button id="zoom-in" type="button">+</button>
+    <button id="zoom-reset" type="button">100%</button>
+    <button id="zoom-fit" type="button">Ajustar</button>
+  </div>
+  <div id="viewport" tabindex="0" title="Atalhos: Ctrl/Cmd +, Ctrl/Cmd -, Ctrl/Cmd 0, Ctrl/Cmd 9">
+    <div id="stage">
+      <div id="container"></div>
+    </div>
+  </div>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
   <script>
     const container = document.getElementById("container");
+    const viewport = document.getElementById("viewport");
+    const stage = document.getElementById("stage");
     const graph = {graph_json};
     const frameId = {json.dumps(graph_id)};
+    const zoomLabel = document.getElementById("zoom-label");
+    const MIN_SCALE = 0.2;
+    const MAX_SCALE = 5.0;
+    let scale = 1;
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let dragScrollLeft = 0;
+    let dragScrollTop = 0;
     const escapeHtml = (text) => text.replace(/[&<>]/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+    const applyZoom = () => {{
+      scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
+      stage.style.transform = `scale(${{scale}})`;
+      zoomLabel.textContent = `${{Math.round(scale * 100)}}%`;
+      notifyParent();
+    }};
+    const setZoom = (nextScale, centerX = null, centerY = null) => {{
+      const prevScale = scale;
+      scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, nextScale));
+      if (centerX !== null && centerY !== null) {{
+        const rect = viewport.getBoundingClientRect();
+        const offsetX = centerX - rect.left + viewport.scrollLeft;
+        const offsetY = centerY - rect.top + viewport.scrollTop;
+        const contentX = offsetX / prevScale;
+        const contentY = offsetY / prevScale;
+        applyZoom();
+        viewport.scrollLeft = contentX * scale - (centerX - rect.left);
+        viewport.scrollTop = contentY * scale - (centerY - rect.top);
+        return;
+      }}
+      applyZoom();
+    }};
+    const zoomIn = () => {{
+      setZoom(scale + 0.1);
+    }};
+    const zoomOut = () => {{
+      setZoom(scale - 0.1);
+    }};
+    const zoomReset = () => {{
+      setZoom(1);
+    }};
+    const fitToWidth = () => {{
+      const svg = container.querySelector('svg');
+      if (!svg) return;
+      const contentWidth = svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width
+        ? svg.viewBox.baseVal.width
+        : svg.getBBox().width || svg.getBoundingClientRect().width;
+      const available = Math.max(120, viewport.clientWidth - 24);
+      if (contentWidth > 0) {{
+        scale = Math.min(MAX_SCALE, Math.max(0.3, available / contentWidth));
+        applyZoom();
+      }}
+    }};
     const notifyParent = () => {{
       try {{
         const body = document.body;
@@ -121,6 +233,84 @@ def mermaid_block_html(graph: str,
       container.innerHTML =
         '<pre>' + escapeHtml(message) + '\\n\\n' + escapeHtml(graph) + '</pre>';
       notifyParent();
+    }};
+    document.getElementById('zoom-in').addEventListener('click', zoomIn);
+    document.getElementById('zoom-out').addEventListener('click', zoomOut);
+    document.getElementById('zoom-reset').addEventListener('click', zoomReset);
+    document.getElementById('zoom-fit').addEventListener('click', fitToWidth);
+    let resizeObserver = null;
+    viewport.addEventListener('wheel', (event) => {{
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      const delta = event.deltaY < 0 ? 0.12 : -0.12;
+      setZoom(scale + delta, event.clientX, event.clientY);
+    }}, {{ passive: false }});
+    viewport.addEventListener('mousedown', (event) => {{
+      if (event.button !== 0) return;
+      isDragging = true;
+      dragStartX = event.clientX;
+      dragStartY = event.clientY;
+      dragScrollLeft = viewport.scrollLeft;
+      dragScrollTop = viewport.scrollTop;
+      viewport.classList.add('dragging');
+      event.preventDefault();
+    }});
+    window.addEventListener('mousemove', (event) => {{
+      if (!isDragging) return;
+      const dx = event.clientX - dragStartX;
+      const dy = event.clientY - dragStartY;
+      viewport.scrollLeft = dragScrollLeft - dx;
+      viewport.scrollTop = dragScrollTop - dy;
+    }});
+    window.addEventListener('mouseup', () => {{
+      isDragging = false;
+      viewport.classList.remove('dragging');
+    }});
+    viewport.addEventListener('mouseleave', () => {{
+      if (!isDragging) viewport.classList.remove('dragging');
+    }});
+    const handleShortcut = (event) => {{
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key;
+      if (key === '+' || key === '=' ) {{
+        event.preventDefault();
+        zoomIn();
+      }} else if (key === '-' || key === '_') {{
+        event.preventDefault();
+        zoomOut();
+      }} else if (key === '0') {{
+        event.preventDefault();
+        zoomReset();
+      }} else if (key === '9' || key === 'f' || key === 'F') {{
+        event.preventDefault();
+        fitToWidth();
+      }}
+    }};
+    window.addEventListener('keydown', handleShortcut);
+    viewport.addEventListener('keydown', handleShortcut);
+    const renderGraph = () => {{
+      if (!window.mermaid) {{
+        showFallback('Mermaid nao carregou no Colab.');
+        return;
+      }}
+      mermaid.render('{graph_id}-svg', graph).then((result) => {{
+        container.innerHTML = result.svg;
+        applyZoom();
+        fitToWidth();
+        viewport.focus();
+        notifyParent();
+        if (resizeObserver) {{
+          resizeObserver.disconnect();
+        }}
+        if (window.ResizeObserver) {{
+          resizeObserver = new ResizeObserver(() => notifyParent());
+          resizeObserver.observe(container);
+          resizeObserver.observe(viewport);
+        }}
+      }}).catch((err) => {{
+        showFallback('Falha ao renderizar Mermaid: ' + String(err));
+        console.error('ptx_analyzer mermaid render error', err);
+      }});
     }};
     try {{
       if (!window.mermaid) {{
@@ -145,18 +335,9 @@ def mermaid_block_html(graph: str,
             edgeLabelBackground: '#ffffff'
           }}
         }});
-        mermaid.render('{graph_id}-svg', graph).then((result) => {{
-          container.innerHTML = result.svg;
-          notifyParent();
-          if (window.ResizeObserver) {{
-            const ro = new ResizeObserver(() => notifyParent());
-            ro.observe(container);
-          }}
-          window.addEventListener('load', notifyParent);
-        }}).catch((err) => {{
-          showFallback('Falha ao renderizar Mermaid: ' + String(err));
-          console.error('ptx_analyzer mermaid render error', err);
-        }});
+        renderGraph();
+        window.addEventListener('load', notifyParent);
+        window.addEventListener('resize', fitToWidth);
       }}
     }} catch (err) {{
       showFallback('Falha ao inicializar Mermaid: ' + String(err));

@@ -567,99 +567,42 @@ class PTXAnalyzer:
         ])
         return "\n".join(lines)
 
-    def _format_mermaid_text(self, max_decisions: int = 12) -> str:
+    def _format_mermaid_text(self,
+                             max_decisions: int = 12,
+                             label_mode: str = "ptx",
+                             source_lines: Optional[list[str]] = None) -> str:
         cfg = analyze_control_flow(self.kernel)
-        sites = cfg.branch_sites if max_decisions <= 0 else cfg.branch_sites[:max_decisions]
-        if not sites:
+        if not cfg.branch_sites:
             return "graph TD\n    Entry([Inicio]) --> Exit([Sem BRA])\n"
 
         blocks, order = build_cfg(self.kernel)
-        site_by_label = {site.block_label: site for site in sites}
-        alias_by_label = {site.block_label: f"B{idx}" for idx, site in enumerate(sites, 1)}
-        terminal_labels = set()
+        sites = cfg.branch_sites if max_decisions <= 0 else cfg.branch_sites[:max_decisions]
+        site_by_label = {site.block_label: site for site in cfg.branch_sites}
+        visible_labels = set(order)
+        if max_decisions > 0:
+            visible_labels = {"__ENTRY__"}
+            for site in sites:
+                visible_labels.add(site.block_label)
+                if site.taken_target in blocks:
+                    visible_labels.add(site.taken_target)
+                if site.fallthrough_target in blocks:
+                    visible_labels.add(site.fallthrough_target)
 
-        def _walk_to_next_bra(start_label):
-            """
-            Segue explicitamente a topologia do CFG até encontrar:
-              - outro bloco que termina em BRA
-              - um bloco terminal (ret/exit)
-            Também retorna a lista exata de blocos intermediários.
-            """
-            if not start_label or start_label not in blocks:
-                return None, []
+        alias_by_label = {label: f"N{idx}" for idx, label in enumerate(order, 1)}
+        visible_order = [label for label in order if label in visible_labels]
+        order_index = {label: idx for idx, label in enumerate(visible_order)}
 
-            visited = set()
-            path = []
-            cur = start_label
-
-            while cur and cur not in visited and cur in blocks:
-                visited.add(cur)
-                path.append(cur)
-                block = blocks[cur]
-
-                if cur in site_by_label:
-                    return cur, path
-                if block.is_terminal:
-                    terminal_labels.add(cur)
-                    return cur, path
-                if not block.exits:
-                    return cur, path
-                if len(block.exits) != 1:
-                    return cur, path
-
-                cur = block.exits[0][1]
-
-            return cur, path
-
-        def _node_text(label):
-            if label in site_by_label:
-                site = site_by_label[label]
-                origin = f"linha {site.source_line}" if site.source_line > 0 else f"PTX {site.line_no}"
-                raw = site.raw.strip().replace('"', "'")
-                return f"{label}<br>{origin}<br>{raw}"
-            block = blocks[label]
-            last = block.instructions[-1] if block.instructions else None
-            if block.is_terminal:
-                return f"{label}<br>{last.op_base if last else 'terminal'}"
-            return f"{label}<br>sequencial"
-
-        lines = ["graph TD", "    Entry([Inicio])"]
-        pending_edges = []
-        for site in sites:
-            src_alias = alias_by_label[site.block_label]
-            for edge_kind, target in (("taken", site.taken_target), ("fallthrough", site.fallthrough_target)):
-                end_label, path = _walk_to_next_bra(target)
-                if end_label:
-                    pending_edges.append((src_alias, edge_kind, end_label, path))
-
-        terminal_alias = {}
-        for idx, label in enumerate(sorted(terminal_labels), 1):
-            terminal_alias[label] = f"T{idx}"
-
-        bra_edges = []
-        for src_alias, edge_kind, end_label, path in pending_edges:
-            dst_alias = alias_by_label.get(end_label, terminal_alias.get(end_label))
-            if dst_alias:
-                bra_edges.append((src_alias, edge_kind, end_label, path, dst_alias))
-
-        bra_nodes = [alias_by_label[site.block_label] for site in sites]
-        order_index = {alias: idx for idx, alias in enumerate(bra_nodes)}
-
-        # Cada back-edge define uma seção de loop explícita pela ordem dos BRAs no código.
-        # Isso inclui tanto retorno para um BRA anterior quanto auto-loop
-        # (o compilador às vezes reduz um `for` para `bra $Lx` dentro do
-        # próprio bloco, como ocorre no baseline global/register).
         raw_sections = []
-        for src_alias, _, _, _, dst_alias in bra_edges:
-            if dst_alias not in order_index or src_alias not in order_index:
-                continue
-            if order_index[dst_alias] <= order_index[src_alias]:
-                start = order_index[dst_alias]
-                end = order_index[src_alias]
-                raw_sections.append((start, end))
+        for label in visible_order:
+            for _, target in blocks[label].exits:
+                if target not in order_index:
+                    continue
+                if order_index[target] <= order_index[label]:
+                    start = order_index[target]
+                    end = order_index[label]
+                    raw_sections.append((start, end))
 
         raw_sections = sorted(set(raw_sections), key=lambda item: (item[0], -(item[1] - item[0])))
-
         sections = []
         for start, end in raw_sections:
             sections.append({
@@ -696,13 +639,86 @@ class PTXAnalyzer:
             for idx in range(sec["start"], sec["end"] + 1):
                 covered_by_section.add(idx)
 
-        linear_nodes = [alias for idx, alias in enumerate(bra_nodes) if idx not in covered_by_section]
+        outside_sections = [label for idx, label in enumerate(visible_order) if idx not in covered_by_section]
 
-        lines.append("    subgraph Entrada")
-        lines.append("        Entry")
-        lines.append("    end")
+        def _source_snippet(label: str) -> str:
+            if not source_lines:
+                return ""
+            block = blocks[label]
+            line_numbers = []
+            seen = set()
+            for instr in block.instructions:
+                src_line = getattr(instr, "source_line", 0)
+                if src_line > 0 and src_line not in seen and 1 <= src_line <= len(source_lines):
+                    seen.add(src_line)
+                    line_numbers.append(src_line)
+            if not line_numbers:
+                return ""
+            snippets = []
+            for src_line in line_numbers[:2]:
+                text = source_lines[src_line - 1].strip()
+                if text:
+                    snippets.append(text)
+            return "<br>".join(snippets[:2])
 
-        alias_to_label = {alias: lbl for lbl, alias in alias_by_label.items()}
+        def _node_text(label):
+            block = blocks[label]
+            if label == "__ENTRY__":
+                site = site_by_label.get(label)
+                if site:
+                    origin = f"linha {site.source_line}" if site.source_line > 0 else f"PTX {site.line_no}"
+                    if label_mode == "source":
+                        source = _source_snippet(label)
+                        if source:
+                            return f"ENTRY<br>{origin}<br>{source}"
+                    raw = site.raw.strip().replace('"', "'")
+                    return f"ENTRY<br>{origin}<br>{raw}"
+                return "ENTRY"
+
+            if label in site_by_label:
+                site = site_by_label[label]
+                origin = f"linha {site.source_line}" if site.source_line > 0 else f"PTX {site.line_no}"
+                if label_mode == "source":
+                    source = _source_snippet(label)
+                    if source:
+                        return f"{label}<br>{origin}<br>{source}"
+                raw = site.raw.strip().replace('"', "'")
+                return f"{label}<br>{origin}<br>{raw}"
+
+            last = block.instructions[-1] if block.instructions else None
+            origin = ""
+            if last and getattr(last, "source_line", 0) > 0:
+                origin = f"linha {last.source_line}<br>"
+            elif last:
+                origin = f"PTX {last.line_no}<br>"
+
+            if block.is_terminal:
+                return f"{label}<br>{origin}{last.op_base if last else 'terminal'}"
+            if last:
+                if label_mode == "source":
+                    source = _source_snippet(label)
+                    if source:
+                        return f"{label}<br>{origin}{source}"
+                last_text = last.raw.strip().replace('"', "'")
+                return f"{label}<br>{origin}{last_text}"
+            return label
+
+        def _node_decl(label, indent="    "):
+            alias = alias_by_label[label]
+            text = (
+                _node_text(label)
+                .replace("\\", "\\\\")
+                .replace('"', "&quot;")
+                .replace("[", "&#91;")
+                .replace("]", "&#93;")
+                .replace("{", "&#123;")
+                .replace("}", "&#125;")
+            )
+            if blocks[label].is_terminal:
+                return f'{indent}{alias}(["{text}"])'
+            return f'{indent}{alias}["{text}"]'
+
+        lines = ["graph TD"]
 
         def _emit_section(section_idx, indent="    "):
             sec = sections[section_idx]
@@ -714,15 +730,15 @@ class PTXAnalyzer:
             pos = sec["start"]
             for child_start, child_end, child_idx in child_ranges:
                 while pos < child_start:
-                    alias = bra_nodes[pos]
-                    lines.append(f"{indent}    {alias}[{_node_text(alias_to_label[alias])}]")
+                    label = visible_order[pos]
+                    lines.append(_node_decl(label, indent + "    "))
                     pos += 1
                 _emit_section(child_idx, indent + "    ")
                 pos = child_end + 1
 
             while pos <= sec["end"]:
-                alias = bra_nodes[pos]
-                lines.append(f"{indent}    {alias}[{_node_text(alias_to_label[alias])}]")
+                label = visible_order[pos]
+                lines.append(_node_decl(label, indent + "    "))
                 pos += 1
 
             lines.append(f"{indent}end")
@@ -730,68 +746,56 @@ class PTXAnalyzer:
         for section_idx in root_sections:
             _emit_section(section_idx)
 
-        if linear_nodes:
-            lines.append("    subgraph FluxoLinear")
-            for alias in linear_nodes:
-                lines.append(f"        {alias}[{_node_text(alias_to_label[alias])}]")
-            lines.append("    end")
-
-        if terminal_alias:
-            lines.append("    subgraph Saida")
-            for label, alias in terminal_alias.items():
-                lines.append(f"        {alias}([{_node_text(label)}])")
+        if outside_sections:
+            lines.append("    subgraph CFG")
+            for label in outside_sections:
+                lines.append(_node_decl(label, "        "))
             lines.append("    end")
 
         lines.append("")
-        lines.append("    %% topologia explicita dos BRAs")
-        lines.append(f"    Entry --> {alias_by_label[sites[0].block_label]}")
-
+        lines.append("    %% grafo completo dos blocos e BRAs")
         emitted = set()
-        for src_alias, edge_kind, end_label, path, dst_alias in bra_edges:
-            intermediates = [lbl for lbl in path[:-1] if lbl in blocks and lbl not in site_by_label]
-            label = edge_kind
-            if intermediates:
-                label += " via " + " -> ".join(intermediates)
-
-            edge = (src_alias, dst_alias, label)
-            if edge in emitted:
-                continue
-            emitted.add(edge)
-            lines.append(f'    {src_alias} -- "{label}" --> {dst_alias}')
+        for label in visible_order:
+            src_alias = alias_by_label[label]
+            for edge_kind, target in blocks[label].exits:
+                if target not in visible_labels:
+                    continue
+                dst_alias = alias_by_label[target]
+                edge = (src_alias, dst_alias, edge_kind)
+                if edge in emitted:
+                    continue
+                emitted.add(edge)
+                lines.append(f'    {src_alias} -- "{edge_kind}" --> {dst_alias}')
 
         lines.extend(["", "    %% destaque"])
+        lines.append("    style CFG fill:#f8fafc,stroke:#60a5fa,stroke-width:1px,color:#111827;")
+        for idx, sec in enumerate(sections, 1):
+            fill = "#fff7ed" if idx % 2 == 1 else "#faf5ff"
+            stroke = "#ea580c" if idx % 2 == 1 else "#9333ea"
+            lines.append(
+                f"    style {sec['name']} fill:{fill},stroke:{stroke},stroke-width:1px,color:#111827;"
+            )
+
         top_branch = max(
-            sites,
+            cfg.branch_sites,
             key=lambda site: (
                 {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
                 site.taken_memory_ops + site.fallthrough_memory_ops,
             ),
         )
-        lines.append("    style Entrada fill:#eef7ff,stroke:#2563eb,stroke-width:1px,color:#111827;")
-        lines.append("    style FluxoLinear fill:#f8fafc,stroke:#60a5fa,stroke-width:1px,color:#111827;")
-        lines.append("    style Saida fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#111827;")
-        for idx, sec in enumerate(sections, 1):
-            if idx % 2 == 1:
-                lines.append(
-                    f"    style {sec['name']} fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#111827;"
-                )
+        for label in visible_order:
+            alias = alias_by_label[label]
+            if blocks[label].is_terminal:
+                lines.append(f"    style {alias} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+            elif label in site_by_label:
+                lines.append(f"    style {alias} fill:#ffffff,stroke:#60a5fa,stroke-width:1px,color:#111827;")
             else:
-                lines.append(
-                    f"    style {sec['name']} fill:#faf5ff,stroke:#9333ea,stroke-width:1px,color:#111827;"
-                )
+                lines.append(f"    style {alias} fill:#fefce8,stroke:#a16207,stroke-width:1px,color:#111827;")
 
-        for alias in linear_nodes:
-            lines.append(f"    style {alias} fill:#ffffff,stroke:#60a5fa,stroke-width:1px,color:#111827;")
-
-        loop_node_aliases = [bra_nodes[idx] for idx in sorted(covered_by_section)]
-        for alias in loop_node_aliases:
-            lines.append(f"    style {alias} fill:#fffbeb,stroke:#f59e0b,stroke-width:1px,color:#111827;")
-
-        lines.append(
-            f"    style {alias_by_label[top_branch.block_label]} fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#111827;"
-        )
-        for label, alias in terminal_alias.items():
-            lines.append(f"    style {alias} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+        if top_branch.block_label in alias_by_label and top_branch.block_label in visible_labels:
+            lines.append(
+                f"    style {alias_by_label[top_branch.block_label]} fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#111827;"
+            )
         return "\n".join(lines) + "\n"
 
     def _format_mermaid_fence(self, max_decisions: int = 12) -> str:
@@ -1015,10 +1019,23 @@ class PTXAnalyzer:
                 return _plot_bra_graph(self.kernel, max_branches)
             return _plot_branch_cfg(self.kernel, max_blocks)
         if view == "mermaid" and mode == "html":
-            graph = self._format_mermaid_text(max_decisions=max_decisions)
+            graphs = {"ptx": self._format_mermaid_text(max_decisions=max_decisions, label_mode="ptx")}
+            src_path = self._infer_source_path()
+            if src_path:
+                try:
+                    with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+                        source_lines = f.read().splitlines()
+                    if any(instr.source_line > 0 for instr in self.kernel.instructions):
+                        graphs["source"] = self._format_mermaid_text(
+                            max_decisions=max_decisions,
+                            label_mode="source",
+                            source_lines=source_lines,
+                        )
+                except Exception:
+                    pass
             try:
                 from IPython.display import HTML, display
-                display(HTML(mermaid_block_html(graph, title=self.kernel.name)))
+                display(HTML(mermaid_block_html(graphs, title=self.kernel.name)))
                 return None
             except Exception:
                 return emit_text(self._format_mermaid_fence(max_decisions=max_decisions), mode="text")
