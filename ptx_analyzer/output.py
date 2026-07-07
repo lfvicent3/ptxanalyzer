@@ -1,5 +1,5 @@
 """
-Helpers de saída padronizada para texto / HTML / widget.
+Helpers de saída padronizada para texto / HTML.
 """
 
 from __future__ import annotations
@@ -38,10 +38,8 @@ def emit_text(text: str, mode: str = "text"):
 
     if mode == "html":
         try:
-            from IPython.display import display
-            import ipywidgets as w
-
-            display(w.HTML(preformatted_html(text)))
+            from IPython.display import HTML, display
+            display(HTML(preformatted_html(text)))
             return text
         except Exception:
             pass

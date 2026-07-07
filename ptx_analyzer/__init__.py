@@ -5,8 +5,7 @@ PTX Analyzer
 from .analyzer import PTXAnalyzer
 from .comparator import PTXComparator
 from .parser import parse_ptx
-from .heuristics import run_heuristics, LEVEL_ICONS, LEVEL_COLORS, LEVEL_TEXT_COLORS
-from .source_view import PTXSourceView
+from .ptxas import parse_ptxas_output
 from .utils import compile_to_ptx, analyze_all_ptx, compare_kernels_in_ptx_file
 from .core import (
     PTXKernel,
@@ -16,39 +15,30 @@ from .core import (
     BranchSite,
     MemoryHotspot,
     ControlFlowAnalysis,
+    PTXASInfo,
     CATEGORIES,
     CATEGORY_COLORS,
     build_cfg,
     analyze_control_flow,
 )
-from .visuals import (
-    plot_bra_graph,
-    plot_decision_tree,
-    plot_gpu_efficiency,
-    plot_instruction_roofline,
-    plot_metric_space_pca,
-    plot_branch_efficiency_registers,
-    plot_memory_hierarchy,
-    plot_runtime_curves,
-)
 from .runtime import (
     RuntimeSample,
     RuntimeBenchmark,
     RuntimeProfile,
+    BenchmarkEntry,
+    BenchmarkSuite,
     compile_cuda_binary,
     parse_runtime_output,
     profile_cuda_runtime,
+    parse_benchmark_output,
+    load_benchmark_csv,
 )
 
 __all__ = [
     "PTXAnalyzer",
     "PTXComparator",
     "parse_ptx",
-    "run_heuristics",
-    "LEVEL_ICONS",
-    "LEVEL_COLORS",
-    "LEVEL_TEXT_COLORS",
-    "PTXSourceView",
+    "parse_ptxas_output",
     "compile_to_ptx",
     "analyze_all_ptx",
     "compare_kernels_in_ptx_file",
@@ -59,22 +49,19 @@ __all__ = [
     "BranchSite",
     "MemoryHotspot",
     "ControlFlowAnalysis",
+    "PTXASInfo",
     "build_cfg",
     "analyze_control_flow",
-    "plot_decision_tree",
-    "plot_bra_graph",
-    "plot_gpu_efficiency",
-    "plot_instruction_roofline",
-    "plot_metric_space_pca",
-    "plot_branch_efficiency_registers",
-    "plot_memory_hierarchy",
-    "plot_runtime_curves",
     "CATEGORIES",
     "CATEGORY_COLORS",
     "RuntimeSample",
     "RuntimeBenchmark",
     "RuntimeProfile",
+    "BenchmarkEntry",
+    "BenchmarkSuite",
     "compile_cuda_binary",
     "parse_runtime_output",
     "profile_cuda_runtime",
+    "parse_benchmark_output",
+    "load_benchmark_csv",
 ]

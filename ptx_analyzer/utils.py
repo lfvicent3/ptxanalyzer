@@ -16,13 +16,15 @@ def compile_to_ptx(src_path: str, out_path: str = None,
     Retorna o caminho do arquivo .ptx gerado.
     Requer nvcc instalado (disponível no Colab com GPU runtime).
     """
-    import subprocess, os
+    import subprocess
 
     if out_path is None:
         out_path = src_path.replace(".cu", ".ptx")
 
-    cmd = f"nvcc -ptx {src_path} -arch={arch} -o {out_path} {extra_flags}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    cmd = ["nvcc", "-ptx", "-lineinfo", "--ptxas-options=-v", src_path, f"-arch={arch}", "-o", out_path]
+    if extra_flags:
+        cmd.extend(extra_flags.split())
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -44,8 +46,7 @@ def analyze_all_ptx(ptx_dir: str) -> PTXComparator:
 
     Uso:
         comp = analyze_all_ptx("./ptx")
-        comp.show_table()
-        comp.plot_radar()
+        comp.summary()
     """
     import os
 

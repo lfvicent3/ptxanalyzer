@@ -9,6 +9,7 @@ import re
 import statistics
 import subprocess
 import tempfile
+import csv
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -19,6 +20,15 @@ _RUNTIME_LINE_RE = re.compile(
     r"(?P<ms>\d+(?:\.\d+)?)\s+ms"
     r"(?P<extra>.*?)"
     r"(?P<status>OK|ERRO|WARN)\s*$"
+)
+
+_BENCHMARK_LINE_RE = re.compile(
+    r"^\s*(?P<algorithm>\S+)\s+"
+    r"(?P<strategy>\S+)\s+"
+    r"segmento=(?P<segment>\d+)\s+"
+    r"tempo=\s*(?P<ms>\d+(?:\.\d+)?)\s+ms\s+"
+    r"validacao=(?P<validation>\S+)\s+"
+    r"vs_baseline=\s*(?P<delta>-?\d+(?:\.\d+)?)%"
 )
 
 
@@ -135,6 +145,41 @@ class RuntimeProfile:
         }
 
 
+@dataclass
+class BenchmarkEntry:
+    algorithm: str
+    strategy: str
+    segment_size: int
+    time_ms: float
+    validation: str
+    baseline_delta_percent: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class BenchmarkSuite:
+    entries: List[BenchmarkEntry] = field(default_factory=list)
+    source_path: Optional[str] = None
+
+    def filter(self,
+               algorithm: Optional[str] = None,
+               strategy: Optional[str] = None) -> List[BenchmarkEntry]:
+        items = self.entries
+        if algorithm is not None:
+            items = [entry for entry in items if entry.algorithm == algorithm]
+        if strategy is not None:
+            items = [entry for entry in items if entry.strategy == strategy]
+        return items
+
+    def to_dict(self) -> dict:
+        return {
+            "source_path": self.source_path,
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
+
+
 def _default_executable_path(src_path: str) -> str:
     base = os.path.splitext(os.path.basename(src_path))[0]
     return os.path.join(tempfile.gettempdir(), f"{base}_ptx_analyzer.bin")
@@ -185,6 +230,42 @@ def parse_runtime_output(output: str) -> List[RuntimeSample]:
             raw_line=raw_line,
         ))
     return samples
+
+
+def parse_benchmark_output(output: str) -> BenchmarkSuite:
+    entries: List[BenchmarkEntry] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _BENCHMARK_LINE_RE.match(line)
+        if not match:
+            continue
+        entries.append(BenchmarkEntry(
+            algorithm=match.group("algorithm"),
+            strategy=match.group("strategy"),
+            segment_size=int(match.group("segment")),
+            time_ms=float(match.group("ms")),
+            validation=match.group("validation"),
+            baseline_delta_percent=float(match.group("delta")),
+        ))
+    return BenchmarkSuite(entries=entries)
+
+
+def load_benchmark_csv(csv_path: str) -> BenchmarkSuite:
+    entries: List[BenchmarkEntry] = []
+    with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            entries.append(BenchmarkEntry(
+                algorithm=(row.get("algorithm") or "").strip(),
+                strategy=(row.get("strategy") or "").strip(),
+                segment_size=int(row.get("segment_size") or 0),
+                time_ms=float(row.get("time_ms") or 0.0),
+                validation=(row.get("validation") or "").strip(),
+                baseline_delta_percent=float(row.get("baseline_delta_percent") or 0.0),
+            ))
+    return BenchmarkSuite(entries=entries, source_path=os.path.abspath(csv_path))
 
 
 def profile_cuda_runtime(

@@ -214,12 +214,39 @@ class ControlFlowAnalysis:
 
 
 @dataclass
+class PTXASInfo:
+    kernel_name: str
+    registers: int = 0
+    shared_mem_bytes: int = 0
+    constant_mem_bytes: int = 0
+    local_mem_bytes: int = 0
+    stack_frame_bytes: int = 0
+    spill_stores_bytes: int = 0
+    spill_loads_bytes: int = 0
+    raw_lines: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "kernel_name": self.kernel_name,
+            "registers": self.registers,
+            "shared_mem_bytes": self.shared_mem_bytes,
+            "constant_mem_bytes": self.constant_mem_bytes,
+            "local_mem_bytes": self.local_mem_bytes,
+            "stack_frame_bytes": self.stack_frame_bytes,
+            "spill_stores_bytes": self.spill_stores_bytes,
+            "spill_loads_bytes": self.spill_loads_bytes,
+            "raw_lines": list(self.raw_lines),
+        }
+
+
+@dataclass
 class PTXKernel:
     name: str
     instructions: List[PTXInstruction] = field(default_factory=list)
     reg_decls: Dict[str, Set[str]] = field(default_factory=dict)
     param_count: int = 0
     file_map: Dict[int, str] = field(default_factory=dict)  # idx → path do .cu
+    ptxas_info: Optional[PTXASInfo] = None
 
     # ── métricas derivadas ──────────────────────────────────────────────────
 
@@ -354,6 +381,8 @@ class PTXKernel:
 
     @property
     def registers_per_thread(self) -> int:
+        if self.ptxas_info is not None and self.ptxas_info.registers > 0:
+            return self.ptxas_info.registers
         return self.total_registers
 
     @property
@@ -371,43 +400,6 @@ class PTXKernel:
     @property
     def divergent_branch_count(self) -> int:
         return self.predicated_branches
-
-    @property
-    def branch_efficiency(self) -> float:
-        """
-        Estimativa estática de branch efficiency.
-        Inferência: menor densidade de branches predicados tende a menor divergência.
-        """
-        return round(max(0.0, 1.0 - min(self.branch_ratio * 4.0, 1.0)), 4)
-
-    @property
-    def simd_utilization_est(self) -> float:
-        """
-        Estimativa estática de uso SIMD/SIMT.
-        Combina branch efficiency com penalização leve por local spills.
-        """
-        spill_penalty = 0.15 if self.local_accesses > 0 else 0.0
-        return round(max(0.0, self.branch_efficiency - spill_penalty), 4)
-
-    @property
-    def coalescing_est(self) -> float:
-        """
-        Estimativa estática de coalescência.
-        Baseada em padrões observáveis no PTX: vetorização, spills e uso de memória global.
-        """
-        global_mem = self.global_loads + self.global_stores
-        if global_mem == 0:
-            return 1.0
-        vector_ops = sum(1 for i in self.instructions if i.op_base in ("ld", "st") and any(v in i.op for v in ("v2", "v4")))
-        score = 0.45
-        score += min(vector_ops / max(global_mem, 1), 1.0) * 0.35
-        if self.local_accesses == 0:
-            score += 0.10
-        if self.shared_accesses > 0:
-            score += 0.05
-        if self.uses_nctaid:
-            score += 0.05
-        return round(min(score, 1.0), 4)
 
     @property
     def instruction_mix(self) -> Dict[str, float]:
@@ -452,9 +444,10 @@ class PTXKernel:
         return self.cfg_stats["loops"]
 
     def metrics_dict(self) -> dict:
+        ptxas = self.ptxas_info
         return {
             "Instruções":           self.total_instructions,
-            "Registradores":        self.total_registers,
+            "RegistradoresDeclarados": self.total_registers,
             "Regs/Thread":          self.registers_per_thread,
             "ld.global":            self.global_loads,
             "st.global":            self.global_stores,
@@ -467,7 +460,6 @@ class PTXKernel:
             "BranchIncondicional":  self.unconditional_branches,
             "Setp":                 self.setp_count,
             "BranchRatio":          self.branch_ratio,
-            "BranchEfficiency":     self.branch_efficiency,
             "Atômicas":             self.atomics,
             "FMA":                  self.fma_count,
             "min/max":              self.min_max_count,
@@ -480,11 +472,16 @@ class PTXKernel:
             "BasicBlocks":          self.basic_block_count,
             "CFGEdges":             self.cfg_edge_count,
             "CFGLoops":             self.cfg_loop_count,
-            "CoalescingEst":        self.coalescing_est,
-            "SIMDUtilEst":          self.simd_utilization_est,
             "GlobalLoadDensity":    self.memory_density["global_load_density"],
             "GlobalStoreDensity":   self.memory_density["global_store_density"],
             "GlobalMemDensity":     self.memory_density["global_memory_density"],
+            "PTXASRegs":            ptxas.registers if ptxas else 0,
+            "PTXASSmemBytes":       ptxas.shared_mem_bytes if ptxas else 0,
+            "PTXASCmemBytes":       ptxas.constant_mem_bytes if ptxas else 0,
+            "PTXASLocalBytes":      ptxas.local_mem_bytes if ptxas else 0,
+            "PTXASStackFrame":      ptxas.stack_frame_bytes if ptxas else 0,
+            "PTXASSpillStores":     ptxas.spill_stores_bytes if ptxas else 0,
+            "PTXASSpillLoads":      ptxas.spill_loads_bytes if ptxas else 0,
         }
 
 
