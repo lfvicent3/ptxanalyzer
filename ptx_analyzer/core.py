@@ -549,7 +549,6 @@ def build_cfg(kernel: PTXKernel) -> Tuple[Dict[str, BasicBlock], List[str]]:
                 # Incondicional (bra.uni): só vai para target
                 if target and target in blocks:
                     block.exits.append(("jump", target))
-                block.is_terminal = True  # sem fall-through sequencial
         elif last.op_base in _TERMINATOR_OPS:
             block.is_terminal = True
         else:

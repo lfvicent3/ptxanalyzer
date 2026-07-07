@@ -8,7 +8,7 @@ import json
 import os
 import re
 import subprocess
-from collections import Counter
+from collections import Counter, deque
 from typing import Optional
 
 from .core import PTXKernel, analyze_control_flow
@@ -382,16 +382,79 @@ class PTXAnalyzer:
             )
 
         visible_sites = cfg.branch_sites if max_decisions <= 0 else cfg.branch_sites[:max_decisions]
-        visible_labels = {"__ENTRY__"}
+        anchor_labels = {"__ENTRY__"}
         for site in visible_sites:
-            visible_labels.add(site.block_label)
+            anchor_labels.add(site.block_label)
             if site.taken_target:
-                visible_labels.add(site.taken_target)
+                anchor_labels.add(site.taken_target)
             if site.fallthrough_target:
-                visible_labels.add(site.fallthrough_target)
+                anchor_labels.add(site.fallthrough_target)
+
+        def _expand_visible_labels() -> set[str]:
+            if max_decisions <= 0:
+                return set(cfg.order)
+
+            visible = set(anchor_labels)
+            if visible:
+                last_anchor_idx = max(
+                    idx for idx, label in enumerate(cfg.order) if label in visible
+                )
+                visible.update(cfg.order[:last_anchor_idx + 1])
+            terminals = {label for label in cfg.order if _is_visual_terminal(label)}
+
+            for label in list(anchor_labels):
+                block = cfg.blocks.get(label)
+                if block is None:
+                    continue
+
+                for _, start in block.exits:
+                    if start not in cfg.blocks or start in visible:
+                        continue
+
+                    queue = deque([(start, [start])])
+                    seen = {start}
+                    connector_path = None
+
+                    while queue:
+                        current, path = queue.popleft()
+                        if current in anchor_labels or current in terminals:
+                            connector_path = path
+                            break
+
+                        for _, nxt in cfg.blocks[current].exits:
+                            if nxt not in cfg.blocks or nxt in seen:
+                                continue
+                            seen.add(nxt)
+                            queue.append((nxt, path + [nxt]))
+
+                    if connector_path:
+                        visible.update(connector_path)
+
+            return visible
 
         alias = {label: f"N{idx}" for idx, label in enumerate(cfg.order, 1)}
         lines = ["graph TD", "    Start([START])"]
+
+        def _is_visual_terminal(label: str) -> bool:
+            block = cfg.blocks[label]
+            if not block.instructions:
+                return False
+            return block.instructions[-1].op_base in ("ret", "exit")
+
+        def _escape_mermaid_text(text: str) -> str:
+            return (
+                text
+                .replace("\\", "\\\\")
+                .replace('"', "'")
+                .replace("[", "&#91;")
+                .replace("]", "&#93;")
+                .replace("{", "&#123;")
+                .replace("}", "&#125;")
+                .replace("(", "&#40;")
+                .replace(")", "&#41;")
+            )
+
+        visible_labels = _expand_visible_labels()
 
         for label in cfg.order:
             if label not in visible_labels:
@@ -399,7 +462,7 @@ class PTXAnalyzer:
             block = cfg.blocks[label]
             if label == "__ENTRY__":
                 text = "ENTRY"
-            elif block.is_terminal:
+            elif _is_visual_terminal(label):
                 last = block.instructions[-1] if block.instructions else None
                 text = f"{label}<br>{last.op_base if last else 'end'}"
             else:
@@ -412,7 +475,8 @@ class PTXAnalyzer:
                         loc = f"PTX {last.line_no}<br>"
                 last_text = last.raw.strip().replace('"', "'") if last else ""
                 text = f"{label}<br>{loc}{last_text}"
-            shape = f'(["{text}"])' if block.is_terminal else f'["{text}"]'
+            text = _escape_mermaid_text(text)
+            shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
             lines.append(f"    {alias[label]}{shape}")
 
         if "__ENTRY__" in alias and "__ENTRY__" in visible_labels:
@@ -450,7 +514,7 @@ class PTXAnalyzer:
             if label not in visible_labels or label not in alias:
                 continue
             block = cfg.blocks[label]
-            if block.is_terminal:
+            if _is_visual_terminal(label):
                 lines.append(f"    style {alias[label]} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
             elif any(edge_type == "conditional" for edge_type, _ in block.exits):
                 lines.append(f"    style {alias[label]} fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#111827;")
