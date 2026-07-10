@@ -11,7 +11,7 @@ import subprocess
 from collections import Counter, deque
 from typing import Optional
 
-from .core import PTXKernel, analyze_control_flow, explain_instruction
+from .core import PTXKernel, analyze_control_flow, explain_instruction, _block_primary_source_line
 from .output import emit_text, mermaid_block_html
 from .parser import parse_ptx
 from .ptxas import parse_ptxas_output
@@ -479,6 +479,17 @@ class PTXAnalyzer:
                 return "Produz o resultado final"
             return explain_instruction(instr)
 
+        def _linear_instruction_name(instrs) -> str:
+            if not instrs:
+                return ""
+            op_names = []
+            for instr in instrs:
+                if instr.op_base in {"setp", "selp", "add", "sub", "mul", "mad", "fma", "ld", "st", "ret", "exit"}:
+                    op_names.append(instr.op)
+            if not op_names:
+                op_names.append(instrs[-1].op)
+            return " + ".join(dict.fromkeys(op_names))
+
         def _linear_source_info(instrs) -> tuple[int, str]:
             for instr in reversed(instrs):
                 if instr.source_line > 0 and instr.op_base not in {"ret", "exit"}:
@@ -503,9 +514,12 @@ class PTXAnalyzer:
         self._last_linear_steps = []
         for idx, (tag, instrs) in enumerate(selected, 1):
             source_line, source_code = _linear_source_info(instrs)
+            raw_instruction_name = _linear_instruction_name(instrs)
             self._last_linear_steps.append({
                 "label": f"__linear_{idx}__",
                 "title": _linear_title(tag),
+                "instruction_name": self._friendly_instruction_caption(raw_instruction_name),
+                "raw_instruction_name": raw_instruction_name,
                 "description": _linear_description(tag, instrs),
                 "tag": tag,
                 "source_line": source_line,
@@ -522,8 +536,10 @@ class PTXAnalyzer:
         prev = "Start"
         for idx, (tag, instrs) in enumerate(selected, 1):
             node_id = f"L{idx}"
+            raw_instr_name = _linear_instruction_name(instrs)
+            ptx_line = f"<br>PTX: {raw_instr_name}" if raw_instr_name else ""
             text = _escape_mermaid_text(
-                f"{_linear_title(tag)}<br>{_linear_description(tag, instrs)}"
+                f"{_linear_title(tag)}<br>{_linear_description(tag, instrs)}{ptx_line}"
             )
             is_terminal = tag == "exit"
             shape = f'(["{text}"])' if is_terminal else f'["{text}"]'
@@ -624,6 +640,162 @@ class PTXAnalyzer:
 
         visible_labels = _expand_visible_labels()
 
+        def _is_decision_block(label: str) -> bool:
+            block = cfg.blocks[label]
+            return any(edge_type == "conditional" for edge_type, _ in block.exits)
+
+        def _decision_source_key(label: str) -> tuple[str, int]:
+            block = cfg.blocks[label]
+            source_guided = self._source_guided_block_text(block)
+            source_line = int(source_guided.get("source_line", 0) or 0)
+            inline_line = int(source_guided.get("inline_source_line", 0) or 0)
+            source_code = (source_guided.get("source_code") or "").strip()
+            inline_source_code = (source_guided.get("inline_source_code") or "").strip()
+            reference_code = source_code or inline_source_code
+            has_compound_operator = ("&&" in reference_code) or ("||" in reference_code)
+
+            # Só tratamos como "Decisão Composta" quando a origem realmente
+            # parece ser uma condição composta no C++ original. Se não houver
+            # código-fonte disponível, mantemos o fallback pela linha.
+            if reference_code and not has_compound_operator:
+                return ("none", 0)
+            if source_line > 0:
+                return ("source", source_line)
+            if inline_line > 0:
+                return ("inline", inline_line)
+            return ("none", 0)
+
+        def _compound_decision_groups() -> list[list[str]]:
+            groups: list[list[str]] = []
+            current: list[str] = []
+            current_key: tuple[str, int] | None = None
+            for label in cfg.order:
+                if label not in visible_labels:
+                    if len(current) > 1:
+                        groups.append(current[:])
+                    current = []
+                    current_key = None
+                    continue
+                if _is_decision_block(label):
+                    decision_key = _decision_source_key(label)
+                    if decision_key == ("none", 0):
+                        if len(current) > 1:
+                            groups.append(current[:])
+                        current = []
+                        current_key = None
+                        continue
+                    if not current:
+                        current = [label]
+                        current_key = decision_key
+                    elif decision_key == current_key:
+                        current.append(label)
+                    else:
+                        if len(current) > 1:
+                            groups.append(current[:])
+                        current = [label]
+                        current_key = decision_key
+                else:
+                    if len(current) > 1:
+                        groups.append(current[:])
+                    current = []
+                    current_key = None
+            if len(current) > 1:
+                groups.append(current[:])
+            return groups
+
+        def _unroll_groups() -> list[tuple[list[str], int, int]]:
+            """Detecta laços desenrolados (loop unrolling) pelo compilador:
+            um loop_site sem nenhum outro laço aninhado dentro dele, cujo
+            corpo repete um mesmo trecho de código-fonte várias vezes. Cada
+            grupo vira uma caixinha "Desenrolado por fator N (linha L)"."""
+            order_index = {label: idx for idx, label in enumerate(cfg.order)}
+
+            def _span_of(loop) -> Optional[tuple[int, int]]:
+                header_idx = order_index.get(loop.header)
+                latch_idx = order_index.get(loop.latch)
+                if header_idx is None or latch_idx is None or latch_idx < header_idx:
+                    return None
+                return header_idx, latch_idx
+
+            groups: list[tuple[list[str], int, int]] = []
+            for loop in cfg.loop_sites:
+                span_range = _span_of(loop)
+                if span_range is None:
+                    continue
+                header_idx, latch_idx = span_range
+                nested = False
+                for other in cfg.loop_sites:
+                    if other is loop:
+                        continue
+                    other_range = _span_of(other)
+                    if other_range is None:
+                        continue
+                    other_header_idx, other_latch_idx = other_range
+                    if header_idx <= other_header_idx and other_latch_idx <= latch_idx and other_range != span_range:
+                        nested = True
+                        break
+                if nested:
+                    continue
+
+                span = [
+                    label for label in cfg.order[header_idx:latch_idx + 1]
+                    if label in visible_labels
+                ]
+                if len(span) < 2:
+                    continue
+
+                line_counts: dict[int, int] = {}
+                for label in span:
+                    line = _block_primary_source_line(cfg.blocks[label])
+                    if line > 0:
+                        line_counts[line] = line_counts.get(line, 0) + 1
+                if not line_counts:
+                    continue
+                body_line, factor = max(line_counts.items(), key=lambda item: item[1])
+                if factor < 2:
+                    continue
+                groups.append((span, factor, body_line))
+            return groups
+
+        def _remainder_groups(
+            unroll_groups: list[tuple[list[str], int, int]]
+        ) -> list[tuple[list[str], int]]:
+            """Localiza o "resto" de um laço desenrolado: o trecho reto
+            (sem back-edge) logo após o corpo desenrolado, que trata as
+            iterações que sobram quando o total não é múltiplo do fator de
+            unroll (até fator-1 iterações extras)."""
+            order_index = {label: idx for idx, label in enumerate(cfg.order)}
+            branch_by_label = {site.block_label: site for site in cfg.branch_sites}
+
+            groups: list[tuple[list[str], int]] = []
+            for span, factor, _body_line in unroll_groups:
+                header, latch = span[0], span[-1]
+                latch_block = cfg.blocks.get(latch)
+                if latch_block is None:
+                    continue
+                exit_target = next(
+                    (target for _, target in latch_block.exits if target != header),
+                    None,
+                )
+                if exit_target is None or exit_target not in order_index:
+                    continue
+                exit_site = branch_by_label.get(exit_target)
+                join_target = exit_site.reconvergence_target if exit_site else None
+                if not join_target or join_target not in order_index:
+                    continue
+                start_idx = order_index[exit_target]
+                end_idx = order_index[join_target]
+                if end_idx <= start_idx:
+                    continue
+                remainder = [
+                    label for label in cfg.order[start_idx:end_idx]
+                    if label in visible_labels
+                ]
+                if len(remainder) < 2:
+                    continue
+                groups.append((remainder, factor - 1))
+            return groups
+
         def _resolve_visual_target(target: str) -> str:
             seen = set()
             current = target
@@ -641,19 +813,88 @@ class PTXAnalyzer:
             if not (label in cfg.blocks and cfg.blocks[label].display_name.startswith("Salto"))
         }
 
+        grouped_labels = set()
+        for group_idx, group in enumerate(_compound_decision_groups(), 1):
+            lines.append(f'    subgraph DECISION_GROUP_{group_idx}["Decisão Composta {group_idx}"]')
+            for label in group:
+                grouped_labels.add(label)
+                block = cfg.blocks[label]
+                source_guided = self._source_guided_block_text(block)
+                raw_op_name = self._display_ptx_name(source_guided.get("raw_instruction_name") or "")
+                ptx_line = f"<br>PTX: {raw_op_name}" if raw_op_name else ""
+                text = (
+                    f"{source_guided['title'] or label}<br>"
+                    f"{source_guided['description'] or 'Executando etapa da decisão'}"
+                    f"{ptx_line}"
+                )
+                text = _escape_mermaid_text(text)
+                shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
+                lines.append(f"        {alias[label]}{shape}")
+            lines.append("    end")
+
+        rendered_unroll_groups: list[tuple[list[str], int, int]] = []
+        for group_idx, (span, factor, body_line) in enumerate(_unroll_groups(), 1):
+            if any(label in grouped_labels for label in span):
+                continue
+            rendered_unroll_groups.append((span, factor, body_line))
+            lines.append(
+                f'    subgraph UNROLL_GROUP_{group_idx}["Desenrolado por fator {factor} (linha {body_line})"]'
+            )
+            for label in span:
+                grouped_labels.add(label)
+                block = cfg.blocks[label]
+                source_guided = self._source_guided_block_text(block)
+                raw_op_name = self._display_ptx_name(source_guided.get("raw_instruction_name") or "")
+                ptx_line = f"<br>PTX: {raw_op_name}" if raw_op_name else ""
+                last = block.instructions[-1] if block.instructions else None
+                details = source_guided["description"] or (last.raw.strip().replace('"', "'") if last else "")
+                text = f"{source_guided['title'] or label}<br>{details}{ptx_line}"
+                text = _escape_mermaid_text(text)
+                shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
+                lines.append(f"        {alias[label]}{shape}")
+            lines.append("    end")
+
+        for group_idx, (remainder, max_extra) in enumerate(_remainder_groups(rendered_unroll_groups), 1):
+            if any(label in grouped_labels for label in remainder):
+                continue
+            extra_label = "iteração restante" if max_extra == 1 else "iterações restantes"
+            lines.append(
+                f'    subgraph REMAINDER_GROUP_{group_idx}["Resto do desenrolamento (até {max_extra} {extra_label})"]'
+            )
+            for label in remainder:
+                grouped_labels.add(label)
+                block = cfg.blocks[label]
+                source_guided = self._source_guided_block_text(block)
+                raw_op_name = self._display_ptx_name(source_guided.get("raw_instruction_name") or "")
+                ptx_line = f"<br>PTX: {raw_op_name}" if raw_op_name else ""
+                last = block.instructions[-1] if block.instructions else None
+                details = source_guided["description"] or (last.raw.strip().replace('"', "'") if last else "")
+                text = f"{source_guided['title'] or label}<br>{details}{ptx_line}"
+                text = _escape_mermaid_text(text)
+                shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
+                lines.append(f"        {alias[label]}{shape}")
+            lines.append("    end")
+
         for label in cfg.order:
             if label not in visible_labels:
                 continue
+            if label in grouped_labels:
+                continue
             block = cfg.blocks[label]
+            source_guided = self._source_guided_block_text(block)
+            raw_op_name = self._display_ptx_name(source_guided.get("raw_instruction_name") or "")
+            ptx_line = f"<br>PTX: {raw_op_name}" if raw_op_name else ""
             if label == "__ENTRY__":
-                text = f"{block.display_name or 'Entrada'}<br>{block.description or 'Inicializando contexto do kernel'}"
+                body = source_guided["description"] or "Inicializando contexto do kernel"
+                text = f"{source_guided['title'] or 'Entrada'}<br>{body}{ptx_line}"
             elif _is_visual_terminal(label):
                 last = block.instructions[-1] if block.instructions else None
-                text = f"{block.display_name or label}<br>{block.description or (last.op_base if last else 'end')}"
+                body = source_guided["description"] or (last.op_base if last else "end")
+                text = f"{source_guided['title'] or label}<br>{body}{ptx_line}"
             else:
                 last = block.instructions[-1] if block.instructions else None
-                details = block.description or (last.raw.strip().replace('"', "'") if last else "")
-                text = f"{block.display_name or label}<br>{details}"
+                details = source_guided["description"] or (last.raw.strip().replace('"', "'") if last else "")
+                text = f"{source_guided['title'] or label}<br>{details}{ptx_line}"
             text = _escape_mermaid_text(text)
             shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
             lines.append(f"    {alias[label]}{shape}")
@@ -765,12 +1006,190 @@ class PTXAnalyzer:
         }
         return info
 
+    def _friendly_instruction_caption(self, instruction_name: str, title: str = "") -> str:
+        text = (instruction_name or "").strip()
+        lowered = text.lower()
+        title_lower = (title or "").lower()
+
+        if "setp" in lowered and "bra" in lowered:
+            return "comparação condicional"
+        if lowered.startswith("setp"):
+            return "comparação"
+        if lowered.startswith("selp"):
+            return "seleção do ajuste"
+        if lowered.startswith("ld.global"):
+            return "leitura em memória global"
+        if lowered.startswith("ld.shared"):
+            return "leitura em memória compartilhada"
+        if lowered.startswith("st.global"):
+            return "escrita em memória global"
+        if lowered.startswith("st.shared"):
+            return "escrita em memória compartilhada"
+        if lowered.startswith("add"):
+            return "atualização de valor"
+        if lowered.startswith("sub"):
+            return "decremento"
+        if lowered.startswith("mov"):
+            if "sequência" in title_lower:
+                return "preparo de registradores"
+            return "movimentação de valor"
+        if lowered.startswith("ret") or lowered.startswith("exit"):
+            return "retorno"
+        if lowered.startswith("call"):
+            return "chamada auxiliar"
+        return text or "etapa"
+
+    def _display_ptx_name(self, raw_instruction_name: str) -> str:
+        raw = (raw_instruction_name or "").strip()
+        if " + " in raw:
+            return raw.split(" + ", 1)[0].strip()
+        return raw
+
+    def _extract_source_condition(self, source_line: str) -> str:
+        compact = " ".join((source_line or "").split())
+        if not compact:
+            return ""
+
+        match = re.search(r"\b(if|while)\s*\((.*)\)\s*\{?$", compact)
+        if match:
+            return match.group(2).strip()
+
+        match = re.search(r"\bfor\s*\(([^;]*);([^;]*);([^\)]*)\)\s*\{?$", compact)
+        if match:
+            return match.group(2).strip()
+
+        return ""
+
+    def _source_guided_block_text(self, block) -> dict:
+        info = self._block_source_info(block)
+        source_code = (info.get("source_code") or "").strip()
+        inline_source_code = (info.get("inline_source_code") or "").strip()
+        reference_code = source_code or inline_source_code
+
+        title = block.display_name
+        instruction_name = block.instruction_name
+        raw_instruction_name = getattr(block, "raw_instruction_name", block.instruction_name)
+        raw_display_name = self._display_ptx_name(raw_instruction_name)
+        description = block.description
+
+        if reference_code:
+            compact = " ".join(reference_code.split())
+            extracted_condition = self._extract_source_condition(compact)
+
+            if compact.startswith("if (base + segment_size > total_elements)"):
+                title = "Limite"
+                instruction_name = "checagem de fronteira"
+                description = "segmento válido"
+            elif compact.startswith("for (int end = count - 1; end > 0; --end)"):
+                if raw_display_name.startswith("setp"):
+                    title = "Laço"
+                    instruction_name = "controle de iteração"
+                    description = extracted_condition or "end > 0"
+                else:
+                    title = "Atualização"
+                    instruction_name = "avanço do laço"
+                    description = "preparo do laço"
+            elif compact.startswith("for (int end = segment_size - 1; end > 0; --end)"):
+                if raw_display_name.startswith("setp"):
+                    title = "Laço"
+                    instruction_name = "controle de iteração"
+                    description = extracted_condition or "end > 0"
+                else:
+                    title = "Atualização"
+                    instruction_name = "avanço do laço"
+                    description = "preparo do laço"
+            elif compact.startswith("for (int i = 0; i < end; ++i)"):
+                if raw_display_name.startswith("setp"):
+                    title = "Laço"
+                    instruction_name = "controle de iteração"
+                    description = extracted_condition or "i < end"
+                else:
+                    title = "Atualização"
+                    instruction_name = "avanço do índice"
+                    description = "preparo do próximo i"
+            elif compact.startswith("if (data[base + i] > data[base + i + 1])"):
+                if raw_display_name.startswith("setp"):
+                    title = "Comparação"
+                    instruction_name = "teste de troca"
+                    description = "data[i] e data[i+1]"
+                elif raw_display_name.startswith(("add", "sub", "mul", "mad", "mov", "ld")):
+                    title = "Preparação"
+                    instruction_name = "endereçamento"
+                    description = "prepara a comparação"
+                elif raw_display_name.startswith("st"):
+                    title = "Escrita"
+                    instruction_name = "troca"
+                    description = "troca parcial"
+            elif compact.startswith("for (int i = 1; i < count; ++i)"):
+                if raw_display_name.startswith("setp"):
+                    title = "Laço"
+                    instruction_name = "controle de iteração"
+                    description = extracted_condition or "i < count"
+                else:
+                    title = "Atualização"
+                    instruction_name = "avanço do índice"
+                    description = "preparo do próximo i"
+            elif compact.startswith("while (j >= 0 && values[j] > key)"):
+                if raw_display_name.startswith("setp"):
+                    title = "Laço"
+                    instruction_name = "teste de deslocamento"
+                    description = extracted_condition or "j >= 0 && values[j] > key"
+                else:
+                    title = "Preparação"
+                    instruction_name = "endereçamento"
+                    description = "prepara a verificação"
+            elif compact.startswith("data_t key = values[i]"):
+                title = "Leitura"
+                instruction_name = "captura da chave"
+                description = "chave"
+            elif compact.startswith("values[j + 1] = values[j]"):
+                title = "Escrita"
+                instruction_name = "movimento à direita"
+                description = "deslocamento"
+            elif compact.startswith("values[j + 1] = key"):
+                title = "Escrita"
+                instruction_name = "posicionamento da chave"
+                description = "inserção"
+            elif compact.startswith("output[idx] = result"):
+                title = "Resultado"
+                instruction_name = "escrita final"
+                description = "Escreve o resultado final na memória global"
+            elif compact.startswith("if (value > threshold)"):
+                title = "Decisão"
+                instruction_name = "comparação com limiar"
+                description = extracted_condition or "value > threshold"
+            elif compact.startswith("result = value + 1"):
+                title = "Atualização"
+                instruction_name = "ajuste positivo"
+                description = "incremento"
+            elif compact.startswith("result = value - 1"):
+                title = "Atualização"
+                instruction_name = "ajuste negativo"
+                description = "decremento"
+
+        instruction_name = self._friendly_instruction_caption(raw_instruction_name, title)
+
+        if block.is_terminal:
+            title = "Saída"
+            instruction_name = self._friendly_instruction_caption(raw_instruction_name or "ret", title)
+            description = "Encerra a execução do kernel"
+
+        info.update({
+            "title": title,
+            "instruction_name": instruction_name,
+            "raw_instruction_name": raw_instruction_name,
+            "repeated_source_instance": getattr(block, "repeated_source_instance", 0),
+            "description": description,
+        })
+        return info
+
     def _control_flow_data_with_source(self) -> dict:
         cfg = analyze_control_flow(self.kernel)
         data = cfg.to_dict()
         for label in data["order"]:
             block = cfg.blocks[label]
-            data["blocks"][label].update(self._block_source_info(block))
+            source_guided = self._source_guided_block_text(block)
+            data["blocks"][label].update(source_guided)
         return data
 
     def _visual_flow_data(self) -> dict:
@@ -788,12 +1207,14 @@ class PTXAnalyzer:
             block = cfg.blocks[label]
             if block.display_name.startswith("Salto"):
                 continue
+            source_guided = self._source_guided_block_text(block)
             node = {
                 "label": label,
-                "title": block.display_name,
-                "description": block.description,
+                "title": source_guided["title"],
+                "instruction_name": source_guided["instruction_name"],
+                "description": source_guided["description"],
             }
-            node.update(self._block_source_info(block))
+            node.update(source_guided)
             nodes.append(node)
         return {
             "kind": "cfg",

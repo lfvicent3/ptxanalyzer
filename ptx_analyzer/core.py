@@ -95,6 +95,9 @@ class BasicBlock:
     is_terminal: bool = False   # ret/exit ou bra.uni sem fall-through
     display_name: str = ""
     description: str = ""
+    instruction_name: str = ""
+    raw_instruction_name: str = ""
+    repeated_source_instance: int = 0
 
 
 @dataclass
@@ -220,6 +223,9 @@ class ControlFlowAnalysis:
                     "is_terminal": block.is_terminal,
                     "display_name": block.display_name,
                     "description": block.description,
+                    "instruction_name": block.instruction_name,
+                    "raw_instruction_name": block.raw_instruction_name,
+                    "repeated_source_instance": block.repeated_source_instance,
                     "exits": [{"type": et, "target": target} for et, target in block.exits],
                 }
                 for label, block in self.blocks.items()
@@ -604,6 +610,52 @@ def _block_primary_source_line(block: BasicBlock) -> int:
     return 0
 
 
+def _representative_instruction(block: BasicBlock) -> Optional[PTXInstruction]:
+    branch = next(
+        (
+            instr for instr in reversed(block.instructions)
+            if instr.op_base == "bra" and instr.is_predicated
+        ),
+        None,
+    )
+    if branch is not None:
+        setp_instr = next(
+            (instr for instr in reversed(block.instructions) if instr.op_base == "setp"),
+            None,
+        )
+        return setp_instr or branch
+
+    for op_base in ("call", "st", "ld", "selp", "add", "sub", "mul", "mad", "fma", "ret", "exit"):
+        instr = next((item for item in block.instructions if item.op_base == op_base), None)
+        if instr is not None:
+            return instr
+
+    return block.instructions[-1] if block.instructions else None
+
+
+def _block_instruction_name(block: BasicBlock) -> str:
+    branch = next(
+        (
+            instr for instr in reversed(block.instructions)
+            if instr.op_base == "bra" and instr.is_predicated
+        ),
+        None,
+    )
+    if branch is not None:
+        setp_instr = next(
+            (instr for instr in reversed(block.instructions) if instr.op_base == "setp"),
+            None,
+        )
+        if setp_instr is not None:
+            return f"{setp_instr.op} + {branch.op}"
+        return branch.op
+
+    instr = _representative_instruction(block)
+    if instr is None:
+        return ""
+    return instr.op
+
+
 def describe_block(block: BasicBlock) -> tuple[str, str]:
     last = block.instructions[-1] if block.instructions else None
     setp_instr = next((instr for instr in reversed(block.instructions) if instr.op_base == "setp"), None)
@@ -666,9 +718,11 @@ def annotate_basic_blocks(blocks: Dict[str, BasicBlock], order: List[str]) -> No
             display_name = f"{title} {title_counts[title]}"
         if source_line > 0 and repeated_line_totals[source_line] > 1:
             repeated_lines[source_line] += 1
-            description = f"{description} (instância desenrolada {repeated_lines[source_line]})"
+            block.repeated_source_instance = repeated_lines[source_line]
         block.display_name = display_name
         block.description = description
+        block.raw_instruction_name = _block_instruction_name(block)
+        block.instruction_name = block.raw_instruction_name
 
 
 def _merge_redundant_same_line_fallthrough_blocks(
