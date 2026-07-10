@@ -4,7 +4,7 @@ Taxonomia e modelo de dados básicos para a análise PTX.
 
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -79,6 +79,9 @@ class PTXInstruction:
     source_file: int = 0     # índice do .file no PTX (0 = desconhecido)
     source_line: int = 0     # linha do .cu original (via .loc, 0 = desconhecido)
     source_col:  int = 0     # coluna do .cu original (via .loc, 0 = desconhecido)
+    inline_source_file: int = 0
+    inline_source_line: int = 0
+    inline_source_col: int = 0
 
 
 @dataclass
@@ -90,6 +93,8 @@ class BasicBlock:
     exits: List[Tuple[str, str]] = field(default_factory=list)
     is_entry: bool = False
     is_terminal: bool = False   # ret/exit ou bra.uni sem fall-through
+    display_name: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -122,6 +127,9 @@ class BranchSite:
     taken_memory_ops: int = 0
     fallthrough_memory_ops: int = 0
     divergence_risk: str = "none"
+    reconvergence_target: Optional[str] = None
+    idle_threads_possible: bool = False
+    simt_effect: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +149,9 @@ class BranchSite:
             "taken_memory_ops": self.taken_memory_ops,
             "fallthrough_memory_ops": self.fallthrough_memory_ops,
             "divergence_risk": self.divergence_risk,
+            "reconvergence_target": self.reconvergence_target,
+            "idle_threads_possible": self.idle_threads_possible,
+            "simt_effect": self.simt_effect,
         }
 
 
@@ -176,12 +187,29 @@ class MemoryHotspot:
 
 
 @dataclass
+class LoopSite:
+    header: str
+    latch: str
+    edge_type: str
+    source_line: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "header": self.header,
+            "latch": self.latch,
+            "edge_type": self.edge_type,
+            "source_line": self.source_line,
+        }
+
+
+@dataclass
 class ControlFlowAnalysis:
     blocks: Dict[str, BasicBlock]
     order: List[str]
     edges: List[CFGEdge]
     branch_sites: List[BranchSite]
     memory_hotspots: List[MemoryHotspot]
+    loop_sites: List[LoopSite] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -190,6 +218,8 @@ class ControlFlowAnalysis:
                     "instruction_count": len(block.instructions),
                     "is_entry": block.is_entry,
                     "is_terminal": block.is_terminal,
+                    "display_name": block.display_name,
+                    "description": block.description,
                     "exits": [{"type": et, "target": target} for et, target in block.exits],
                 }
                 for label, block in self.blocks.items()
@@ -210,6 +240,7 @@ class ControlFlowAnalysis:
             ],
             "branch_sites": [site.to_dict() for site in self.branch_sites],
             "memory_hotspots": [hotspot.to_dict() for hotspot in self.memory_hotspots],
+            "loop_sites": [loop.to_dict() for loop in self.loop_sites],
         }
 
 
@@ -492,6 +523,195 @@ class PTXKernel:
 _TERMINATOR_OPS = {"ret", "exit", "brx"}
 
 
+def _humanize_operand(operand: str) -> str:
+    operand = operand.strip()
+    return operand if operand else "valor"
+
+
+def explain_instruction(instr: Optional[PTXInstruction]) -> str:
+    if instr is None:
+        return "Sem instrução associada"
+
+    op = instr.op_base
+    ops = instr.operands
+
+    if op == "setp":
+        if any(token in instr.op for token in (".le.", ".lt.", ".gt.", ".ge.")):
+            if len(ops) >= 3:
+                return (
+                    "Comparando valores para decidir o próximo passo "
+                    f"entre {_humanize_operand(ops[1])} e {_humanize_operand(ops[2])}"
+                )
+        if len(ops) >= 3:
+            return f"Testando condição entre {_humanize_operand(ops[1])} e {_humanize_operand(ops[2])}"
+        return "Testando condição"
+    if op == "bra":
+        target = ops[-1] if ops else "destino"
+        return f"Desvio condicional para {target}" if instr.is_predicated else f"Saltando para {target}"
+    if op == "ld":
+        scope = (
+            "global" if "global" in instr.op else
+            "shared" if "shared" in instr.op else
+            "local" if "local" in instr.op else
+            "de parâmetros" if "param" in instr.op else
+            "memória"
+        )
+        if any(offset in instr.raw for offset in ("+4", "-4", "+8", "-8", "+12", "-12", "+16", "-16")):
+            return f"Carregando elementos adjacentes da memória {scope}"
+        return f"Carregando dados da memória {scope}"
+    if op == "st":
+        scope = (
+            "global" if "global" in instr.op else
+            "shared" if "shared" in instr.op else
+            "local" if "local" in instr.op else
+            "de parâmetros" if "param" in instr.op else
+            "memória"
+        )
+        if "shared" in instr.op:
+            return "Escrevendo resultado do swap na memória shared"
+        return f"Escrevendo dados na memória {scope}"
+    if op == "add":
+        return "Efetuando soma"
+    if op == "sub":
+        return "Efetuando subtração"
+    if op in {"mul", "mad", "fma"}:
+        return "Efetuando multiplicação"
+    if op in {"and", "or", "xor", "shl", "shr"}:
+        return "Aplicando operação lógica"
+    if op == "mov":
+        return "Movendo valor entre registradores"
+    if op == "selp":
+        return "Selecionando valor por predicado"
+    if op == "call":
+        callee = ops[1] if len(ops) >= 2 else ops[0] if ops else "função"
+        if "add" in callee:
+            return "Incrementa o valor"
+        if "sub" in callee:
+            return "Decrementa o valor"
+        return f"Chamando {callee}"
+    if op in {"ret", "exit"}:
+        return "Encerrando kernel"
+    return instr.raw.strip()
+
+
+def _block_primary_source_line(block: BasicBlock) -> int:
+    for instr in block.instructions:
+        if instr.source_line > 0 and instr.op_base not in {"ret", "exit"}:
+            return instr.source_line
+    for instr in block.instructions:
+        if instr.source_line > 0:
+            return instr.source_line
+    return 0
+
+
+def describe_block(block: BasicBlock) -> tuple[str, str]:
+    last = block.instructions[-1] if block.instructions else None
+    setp_instr = next((instr for instr in reversed(block.instructions) if instr.op_base == "setp"), None)
+    shared_loads = [instr for instr in block.instructions if instr.op_base == "ld" and "shared" in instr.op]
+    shared_stores = [instr for instr in block.instructions if instr.op_base == "st" and "shared" in instr.op]
+
+    if last and last.op_base == "bra" and last.is_predicated:
+        if shared_loads and setp_instr is not None:
+            return "Decisão", "Compara elementos adjacentes e decide se precisa trocar"
+        condition_text = explain_instruction(setp_instr) if setp_instr else "Avaliando predicado para decidir o próximo bloco"
+        if block.is_entry:
+            return "Entrada", condition_text
+        return "Decisão", condition_text
+
+    if block.is_entry:
+        return "Entrada", "Inicializando contexto do kernel"
+    if block.is_terminal:
+        return "Saída", explain_instruction(last) if last else "Encerrando fluxo"
+
+    call_instr = next((instr for instr in block.instructions if instr.op_base == "call"), None)
+    if call_instr is not None:
+        return "Chamada", explain_instruction(call_instr)
+
+    if shared_stores:
+        return "Escrita", "Realiza swap / atualização dos valores na memória shared"
+
+    for instr in block.instructions:
+        if instr.op_base == "st":
+            return "Escrita", explain_instruction(instr)
+        if instr.op_base == "ld":
+            return "Leitura", explain_instruction(instr)
+        if instr.op_base in {"add", "sub", "mul", "mad", "fma"}:
+            return "Cálculo", explain_instruction(instr)
+
+    if last and last.op_base == "bra":
+        return "Salto", "Segue para o próximo ramo do fluxo"
+    if block.label.startswith("__seq_"):
+        return "Sequência", "Executando instruções sequenciais"
+    if block.label == "__ENTRY__":
+        return "Entrada", "Inicializando contexto do kernel"
+    return "Bloco", explain_instruction(last) if last else "Executando instruções"
+
+
+def annotate_basic_blocks(blocks: Dict[str, BasicBlock], order: List[str]) -> None:
+    title_counts: Dict[str, int] = defaultdict(int)
+    repeated_lines: Dict[int, int] = defaultdict(int)
+    repeated_line_totals = Counter(
+        _block_primary_source_line(block)
+        for block in blocks.values()
+        if _block_primary_source_line(block) > 0
+    )
+    for label in order:
+        block = blocks[label]
+        title, description = describe_block(block)
+        source_line = _block_primary_source_line(block)
+        if label == "__ENTRY__":
+            display_name = "Entrada"
+        else:
+            title_counts[title] += 1
+            display_name = f"{title} {title_counts[title]}"
+        if source_line > 0 and repeated_line_totals[source_line] > 1:
+            repeated_lines[source_line] += 1
+            description = f"{description} (instância desenrolada {repeated_lines[source_line]})"
+        block.display_name = display_name
+        block.description = description
+
+
+def _merge_redundant_same_line_fallthrough_blocks(
+    blocks: Dict[str, BasicBlock],
+    order: List[str],
+) -> Tuple[Dict[str, BasicBlock], List[str]]:
+    changed = True
+    while changed:
+        changed = False
+        predecessors: Dict[str, List[str]] = defaultdict(list)
+        for src in order:
+            for _, target in blocks[src].exits:
+                if target in blocks:
+                    predecessors[target].append(src)
+
+        for idx in range(len(order) - 1):
+            current_label = order[idx]
+            next_label = order[idx + 1]
+            current = blocks[current_label]
+            nxt = blocks[next_label]
+            current_line = _block_primary_source_line(current)
+            next_line = _block_primary_source_line(nxt)
+
+            if current_line == 0 or current_line != next_line:
+                continue
+            if current.is_terminal or nxt.is_entry:
+                continue
+            if len(current.exits) != 1 or current.exits[0] != ("fallthrough", next_label):
+                continue
+            if predecessors.get(next_label, []) != [current_label]:
+                continue
+
+            current.instructions.extend(nxt.instructions)
+            current.exits = list(nxt.exits)
+            current.is_terminal = nxt.is_terminal
+            del blocks[next_label]
+            order.pop(idx + 1)
+            changed = True
+            break
+
+    return blocks, order
+
+
 def build_cfg(kernel: PTXKernel) -> Tuple[Dict[str, BasicBlock], List[str]]:
     """
     Constrói o CFG do kernel a partir de suas instruções.
@@ -564,6 +784,9 @@ def build_cfg(kernel: PTXKernel) -> Tuple[Dict[str, BasicBlock], List[str]]:
     if order:
         blocks[order[0]].is_entry = True
 
+    blocks, order = _merge_redundant_same_line_fallthrough_blocks(blocks, order)
+    annotate_basic_blocks(blocks, order)
+
     return blocks, order
 
 
@@ -628,6 +851,64 @@ def _find_back_edges(blocks: Dict[str, BasicBlock], order: List[str]) -> Set[Tup
             dfs_iter.pop()
 
     return back_edges
+
+
+def _successor_map(blocks: Dict[str, BasicBlock], order: List[str]) -> Dict[str, Set[str]]:
+    return {
+        label: {target for _, target in blocks[label].exits if target in blocks}
+        for label in order
+    }
+
+
+def _compute_postdominators(blocks: Dict[str, BasicBlock], order: List[str]) -> Dict[str, Set[str]]:
+    if not order:
+        return {}
+
+    all_nodes = set(order)
+    successors = _successor_map(blocks, order)
+    terminals = {label for label in order if not successors[label]}
+    if not terminals:
+        terminals = {order[-1]}
+
+    postdom: Dict[str, Set[str]] = {}
+    for label in order:
+        postdom[label] = {label} if label in terminals else set(all_nodes)
+
+    changed = True
+    while changed:
+        changed = False
+        for label in reversed(order):
+            if label in terminals:
+                continue
+            succs = successors[label]
+            if not succs:
+                new_set = {label}
+            else:
+                intersection = set(all_nodes)
+                for succ in succs:
+                    intersection &= postdom[succ]
+                new_set = {label} | intersection
+            if new_set != postdom[label]:
+                postdom[label] = new_set
+                changed = True
+    return postdom
+
+
+def _compute_immediate_postdominators(blocks: Dict[str, BasicBlock], order: List[str]) -> Dict[str, Optional[str]]:
+    postdom = _compute_postdominators(blocks, order)
+    ipdom: Dict[str, Optional[str]] = {label: None for label in order}
+
+    for label in order:
+        candidates = postdom.get(label, set()) - {label}
+        if not candidates:
+            continue
+        chosen = None
+        for candidate in candidates:
+            if all(candidate not in postdom.get(other, set()) for other in candidates if other != candidate):
+                chosen = candidate
+                break
+        ipdom[label] = chosen
+    return ipdom
 
 
 def _count_block_memory_ops(block: Optional[BasicBlock]) -> int:
@@ -726,10 +1007,23 @@ def analyze_control_flow(kernel: PTXKernel) -> ControlFlowAnalysis:
     """
     blocks, order = build_cfg(kernel)
     back_edges = _find_back_edges(blocks, order)
+    ipdom = _compute_immediate_postdominators(blocks, order)
 
     edges: List[CFGEdge] = []
     branch_sites: List[BranchSite] = []
     memory_hotspots: List[MemoryHotspot] = []
+    loop_sites: List[LoopSite] = []
+
+    for src, target in sorted(back_edges):
+        src_block = blocks.get(src)
+        last = src_block.instructions[-1] if src_block and src_block.instructions else None
+        edge_type = next((kind for kind, dst in src_block.exits if dst == target), "loop") if src_block else "loop"
+        loop_sites.append(LoopSite(
+            header=target,
+            latch=src,
+            edge_type=edge_type,
+            source_line=last.source_line if last else 0,
+        ))
 
     for lbl in order:
         block = blocks[lbl]
@@ -763,6 +1057,12 @@ def analyze_control_flow(kernel: PTXKernel) -> ControlFlowAnalysis:
         taken_block = blocks.get(taken_target) if taken_target else None
         fallthrough_block = blocks.get(fallthrough_target) if fallthrough_target else None
         setp_instr = _find_setp_for_branch(block.instructions, len(block.instructions) - 1)
+        idle_threads_possible = bool(last.is_predicated and taken_target and fallthrough_target)
+        simt_effect = (
+            "Threads do mesmo warp podem se dividir entre os dois caminhos até a reconvergência."
+            if idle_threads_possible else
+            "Sem perda SIMT relevante neste desvio."
+        )
 
         branch_sites.append(BranchSite(
             block_label=lbl,
@@ -781,6 +1081,9 @@ def analyze_control_flow(kernel: PTXKernel) -> ControlFlowAnalysis:
             taken_memory_ops=_count_block_memory_ops(taken_block),
             fallthrough_memory_ops=_count_block_memory_ops(fallthrough_block),
             divergence_risk=_estimate_divergence_risk(last, taken_block, fallthrough_block),
+            reconvergence_target=ipdom.get(lbl),
+            idle_threads_possible=idle_threads_possible,
+            simt_effect=simt_effect,
         ))
 
     return ControlFlowAnalysis(
@@ -793,4 +1096,5 @@ def analyze_control_flow(kernel: PTXKernel) -> ControlFlowAnalysis:
             key=lambda item: (item.memory_ops, item.memory_density, item.instruction_count),
             reverse=True,
         ),
+        loop_sites=loop_sites,
     )

@@ -20,6 +20,7 @@ from .core import (
     CATEGORY_COLORS,
     build_cfg,
     analyze_control_flow,
+    explain_instruction,
 )
 from .runtime import (
     RuntimeSample,
@@ -52,6 +53,7 @@ __all__ = [
     "PTXASInfo",
     "build_cfg",
     "analyze_control_flow",
+    "explain_instruction",
     "CATEGORIES",
     "CATEGORY_COLORS",
     "RuntimeSample",

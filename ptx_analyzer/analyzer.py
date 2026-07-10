@@ -11,7 +11,7 @@ import subprocess
 from collections import Counter, deque
 from typing import Optional
 
-from .core import PTXKernel, analyze_control_flow
+from .core import PTXKernel, analyze_control_flow, explain_instruction
 from .output import emit_text, mermaid_block_html
 from .parser import parse_ptx
 from .ptxas import parse_ptxas_output
@@ -310,10 +310,17 @@ class PTXAnalyzer:
             lines.append("    nenhum branch `BRA` encontrado")
         for idx, site in enumerate(sites, 1):
             loc = f"linha .cu {site.source_line}" if site.source_line > 0 else f"PTX:{site.line_no}"
+            condition = explain_instruction(
+                next(
+                    (instr for instr in self.kernel.instructions if instr.line_no == site.setp_line),
+                    None,
+                )
+            ) if site.setp_line > 0 else "sem setp associado"
             lines.append(
                 f"    B{idx:02d} {site.block_label:<18} {loc:<14} risco={site.divergence_risk:<6} "
                 f"taken={site.taken_target or '-':<16} fall={site.fallthrough_target or '-'}"
             )
+            lines.append(f"         {condition}")
 
         lines.append("")
         lines.append("  Memória:")
@@ -371,15 +378,176 @@ class PTXAnalyzer:
         lines.append("")
         return "\n".join(lines)
 
+    def _format_linear_execution_mermaid(self) -> str:
+        source_lines = self._load_source_lines()
+
+        def _classify_linear_step(instr):
+            if instr.op_base == "ld" and "param" in instr.op:
+                return "params"
+            if instr.op_base in {"mov", "mad", "mul", "cvt"}:
+                return "index"
+            if instr.op_base == "cvta":
+                return "address"
+            if instr.op_base == "add" and any(op.startswith("%rd") for op in instr.operands[:2]):
+                return "address"
+            if instr.op_base == "shl" and any(op.startswith("%rd") for op in instr.operands[:1]):
+                return "address"
+            if instr.op_base == "ld" and "global" in instr.op:
+                return "load"
+            if instr.op_base == "setp":
+                return "compare"
+            if instr.op_base == "selp":
+                return "select"
+            if instr.op_base in {"add", "sub"}:
+                return "compute"
+            if instr.op_base == "call":
+                return "call"
+            if instr.op_base == "st" and "global" in instr.op:
+                return "store"
+            if instr.op_base in {"ret", "exit"}:
+                return "exit"
+            return None
+
+        grouped = []
+        current_tag = None
+        current_instrs = []
+        for instr in self.kernel.instructions:
+            tag = _classify_linear_step(instr)
+            if tag is None:
+                continue
+            if tag != current_tag and current_instrs:
+                grouped.append((current_tag, current_instrs))
+                current_instrs = []
+            current_tag = tag
+            current_instrs.append(instr)
+        if current_instrs:
+            grouped.append((current_tag, current_instrs))
+
+        selected = [
+            (tag, instrs)
+            for tag, instrs in grouped
+            if tag in {"compare", "select", "compute", "call", "store", "exit"}
+        ]
+        if not selected:
+            self._last_linear_steps = []
+            self._last_linear_metadata = {
+                "has_predicated_selection": False,
+                "has_compare": False,
+                "has_select": False,
+                "note": "",
+            }
+            return (
+                "graph LR\n"
+                "    Start([START]) --> Exit([Sem etapas semânticas relevantes])\n"
+                "    style Start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#111827;\n"
+            )
+
+        def _escape_mermaid_text(text: str) -> str:
+            return (
+                text
+                .replace("\\", "\\\\")
+                .replace('"', "'")
+                .replace("[", "&#91;")
+                .replace("]", "&#93;")
+                .replace("{", "&#123;")
+                .replace("}", "&#125;")
+                .replace("(", "&#40;")
+                .replace(")", "&#41;")
+            )
+
+        def _linear_title(tag: str) -> str:
+            return {
+                "compare": "Decisão",
+                "select": "Escolha",
+                "compute": "Atualização",
+                "call": "Ação",
+                "store": "Resultado",
+                "exit": "Saída",
+            }.get(tag, tag)
+
+        def _linear_description(tag: str, instrs) -> str:
+            instr = instrs[-1]
+            if tag == "compare":
+                return "Compara o valor com o limiar"
+            if tag == "select":
+                return "Escolhe entre incrementar ou decrementar"
+            if tag == "compute":
+                return "Aplica o ajuste ao valor"
+            if tag == "call":
+                return explain_instruction(instr)
+            if tag == "store":
+                return "Produz o resultado final"
+            return explain_instruction(instr)
+
+        def _linear_source_info(instrs) -> tuple[int, str]:
+            for instr in reversed(instrs):
+                if instr.source_line > 0 and instr.op_base not in {"ret", "exit"}:
+                    return instr.source_line, source_lines.get(instr.source_line, "")
+            for instr in reversed(instrs):
+                if instr.source_line > 0:
+                    return instr.source_line, source_lines.get(instr.source_line, "")
+            return 0, ""
+
+        has_compare = any(tag == "compare" for tag, _ in selected)
+        has_select = any(tag == "select" for tag, _ in selected)
+        has_predicated_selection = has_compare and has_select
+        note = ""
+        if has_predicated_selection:
+            note = (
+                "O PTX não gerou dois caminhos de controle separados. "
+                "O compilador linearizou o if/else em comparação + seleção predicada "
+                "(por exemplo, setp/selp), então a decisão aparece como escolha de dados, "
+                "não como salto bra."
+            )
+
+        self._last_linear_steps = []
+        for idx, (tag, instrs) in enumerate(selected, 1):
+            source_line, source_code = _linear_source_info(instrs)
+            self._last_linear_steps.append({
+                "label": f"__linear_{idx}__",
+                "title": _linear_title(tag),
+                "description": _linear_description(tag, instrs),
+                "tag": tag,
+                "source_line": source_line,
+                "source_code": source_code,
+            })
+        self._last_linear_metadata = {
+            "has_predicated_selection": has_predicated_selection,
+            "has_compare": has_compare,
+            "has_select": has_select,
+            "note": note,
+        }
+
+        lines = ["graph LR", "    Start([START])"]
+        prev = "Start"
+        for idx, (tag, instrs) in enumerate(selected, 1):
+            node_id = f"L{idx}"
+            text = _escape_mermaid_text(
+                f"{_linear_title(tag)}<br>{_linear_description(tag, instrs)}"
+            )
+            is_terminal = tag == "exit"
+            shape = f'(["{text}"])' if is_terminal else f'["{text}"]'
+            lines.append(f"    {node_id}{shape}")
+            lines.append(f"    {prev} --> {node_id}")
+            prev = node_id
+
+        lines.append("    style Start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#111827;")
+        for idx, (tag, instrs) in enumerate(selected, 1):
+            node_id = f"L{idx}"
+            if tag == "exit":
+                lines.append(f"    style {node_id} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+            elif tag == "store":
+                lines.append(f"    style {node_id} fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#111827;")
+            elif tag in {"compare", "select"}:
+                lines.append(f"    style {node_id} fill:#fee2e2,stroke:#dc2626,stroke-width:1px,color:#111827;")
+            else:
+                lines.append(f"    style {node_id} fill:#f8fafc,stroke:#60a5fa,stroke-width:1px,color:#111827;")
+        return "\n".join(lines) + "\n"
+
     def _format_mermaid_text(self, max_decisions: int = 0) -> str:
         cfg = analyze_control_flow(self.kernel)
         if not cfg.branch_sites:
-            return (
-                "graph TD\n"
-                "    Start([START]) --> Entry([ENTRY])\n"
-                "    Entry --> Exit([Sem BRA])\n"
-                "    style Start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#111827;\n"
-            )
+            return self._format_linear_execution_mermaid()
 
         visible_sites = cfg.branch_sites if max_decisions <= 0 else cfg.branch_sites[:max_decisions]
         anchor_labels = {"__ENTRY__"}
@@ -433,7 +601,7 @@ class PTXAnalyzer:
             return visible
 
         alias = {label: f"N{idx}" for idx, label in enumerate(cfg.order, 1)}
-        lines = ["graph TD", "    Start([START])"]
+        lines = ["graph LR", "    Start([START])"]
 
         def _is_visual_terminal(label: str) -> bool:
             block = cfg.blocks[label]
@@ -456,25 +624,36 @@ class PTXAnalyzer:
 
         visible_labels = _expand_visible_labels()
 
+        def _resolve_visual_target(target: str) -> str:
+            seen = set()
+            current = target
+            while current in cfg.blocks and current not in seen:
+                seen.add(current)
+                block = cfg.blocks[current]
+                if block.display_name.startswith("Salto") and len(block.exits) == 1:
+                    current = block.exits[0][1]
+                    continue
+                break
+            return current
+
+        visible_labels = {
+            label for label in visible_labels
+            if not (label in cfg.blocks and cfg.blocks[label].display_name.startswith("Salto"))
+        }
+
         for label in cfg.order:
             if label not in visible_labels:
                 continue
             block = cfg.blocks[label]
             if label == "__ENTRY__":
-                text = "ENTRY"
+                text = f"{block.display_name or 'Entrada'}<br>{block.description or 'Inicializando contexto do kernel'}"
             elif _is_visual_terminal(label):
                 last = block.instructions[-1] if block.instructions else None
-                text = f"{label}<br>{last.op_base if last else 'end'}"
+                text = f"{block.display_name or label}<br>{block.description or (last.op_base if last else 'end')}"
             else:
                 last = block.instructions[-1] if block.instructions else None
-                loc = ""
-                if last is not None:
-                    if last.source_line > 0:
-                        loc = f"linha {last.source_line}<br>"
-                    else:
-                        loc = f"PTX {last.line_no}<br>"
-                last_text = last.raw.strip().replace('"', "'") if last else ""
-                text = f"{label}<br>{loc}{last_text}"
+                details = block.description or (last.raw.strip().replace('"', "'") if last else "")
+                text = f"{block.display_name or label}<br>{details}"
             text = _escape_mermaid_text(text)
             shape = f'(["{text}"])' if _is_visual_terminal(label) else f'["{text}"]'
             lines.append(f"    {alias[label]}{shape}")
@@ -495,20 +674,29 @@ class PTXAnalyzer:
             other_edges = []
 
             for edge_type, target in block.exits:
-                if target not in alias or target not in visible_labels:
+                visual_target = _resolve_visual_target(target)
+                if visual_target not in alias or visual_target not in visible_labels:
                     continue
-                edge_key = (label, target, edge_type)
+                edge_key = (label, visual_target, edge_type)
                 if edge_key in emitted:
                     continue
                 if edge_type == "fallthrough":
-                    fallthrough_edges.append((edge_type, target))
+                    fallthrough_edges.append((edge_type, visual_target))
                 else:
-                    other_edges.append((edge_type, target))
+                    other_edges.append((edge_type, visual_target))
 
             for edge_type, target in fallthrough_edges + other_edges:
-                emitted.add((label, target, edge_type))
-                edge_label = "taken" if edge_type == "conditional" else edge_type
-                lines.append(f'    {src} -- "{edge_label}" --> {alias[target]}')
+                visual_target = _resolve_visual_target(target)
+                if visual_target not in alias or visual_target not in visible_labels:
+                    continue
+                emitted.add((label, visual_target, edge_type))
+                edge_label = (
+                    "Sim" if edge_type == "conditional" else
+                    "Não" if edge_type == "fallthrough" and any(t == "conditional" for t, _ in block.exits) else
+                    "Segue" if edge_type == "fallthrough" else
+                    "Vai para"
+                )
+                lines.append(f'    {src} -- "{edge_label}" --> {alias[visual_target]}')
 
         for label in cfg.order:
             if label not in visible_labels or label not in alias:
@@ -535,6 +723,911 @@ class PTXAnalyzer:
         if self._origin_path:
             self._source_path = self._find_related_source(self._origin_path)
         return self._source_path
+
+    def _load_source_lines(self) -> dict[int, str]:
+        source_path = self._infer_source_path()
+        if not source_path or not os.path.exists(source_path):
+            return {}
+        try:
+            with open(source_path, "r", encoding="utf-8", errors="replace") as handle:
+                return {
+                    idx: line.rstrip()
+                    for idx, line in enumerate(handle, 1)
+                }
+        except Exception:
+            return {}
+
+    def _block_source_info(self, block) -> dict:
+        source_lines = self._load_source_lines()
+
+        def _pick_representative_line(attr_name: str) -> int:
+            for instr in reversed(block.instructions):
+                line_no = getattr(instr, attr_name, 0)
+                if line_no <= 0:
+                    continue
+                if instr.op_base in {"ret", "exit"}:
+                    continue
+                return line_no
+            for instr in reversed(block.instructions):
+                line_no = getattr(instr, attr_name, 0)
+                if line_no > 0:
+                    return line_no
+            return 0
+
+        source_line = _pick_representative_line("source_line")
+        inline_source_line = _pick_representative_line("inline_source_line")
+
+        info = {
+            "source_line": source_line,
+            "source_code": source_lines.get(source_line, "") if source_line > 0 else "",
+            "inline_source_line": inline_source_line,
+            "inline_source_code": source_lines.get(inline_source_line, "") if inline_source_line > 0 else "",
+        }
+        return info
+
+    def _control_flow_data_with_source(self) -> dict:
+        cfg = analyze_control_flow(self.kernel)
+        data = cfg.to_dict()
+        for label in data["order"]:
+            block = cfg.blocks[label]
+            data["blocks"][label].update(self._block_source_info(block))
+        return data
+
+    def _visual_flow_data(self) -> dict:
+        cfg = analyze_control_flow(self.kernel)
+        if not cfg.branch_sites:
+            self._format_linear_execution_mermaid()
+            return {
+                "kind": "linear",
+                "nodes": list(getattr(self, "_last_linear_steps", [])),
+                "metadata": dict(getattr(self, "_last_linear_metadata", {})),
+            }
+
+        nodes = []
+        for label in cfg.order:
+            block = cfg.blocks[label]
+            if block.display_name.startswith("Salto"):
+                continue
+            node = {
+                "label": label,
+                "title": block.display_name,
+                "description": block.description,
+            }
+            node.update(self._block_source_info(block))
+            nodes.append(node)
+        return {
+            "kind": "cfg",
+            "nodes": nodes,
+        }
+
+    def _dynamic_block_lookup(self, control_flow: dict, visual_flow: dict) -> dict:
+        line_to_labels: dict[int, list[str]] = {}
+        for label in control_flow.get("order", []):
+            block = control_flow["blocks"][label]
+            line_no = int(block.get("source_line", 0) or 0)
+            if line_no <= 0:
+                continue
+            line_to_labels.setdefault(line_no, []).append(label)
+
+        visible_labels = set()
+        if visual_flow.get("kind") == "cfg":
+            visible_labels = {node["label"] for node in visual_flow.get("nodes", [])}
+        else:
+            for node in visual_flow.get("nodes", []):
+                line_no = int(node.get("source_line", 0) or 0)
+                label = node.get("label")
+                if line_no > 0 and label:
+                    line_to_labels.setdefault(line_no, []).append(label)
+                    visible_labels.add(label)
+        return {
+            "line_to_labels": line_to_labels,
+            "visible_labels": visible_labels,
+        }
+
+    def _resolve_block_from_line(self, line_no: int, lookup: dict, fallback: Optional[str] = None) -> Optional[str]:
+        labels = list(lookup.get("line_to_labels", {}).get(line_no, []))
+        visible = lookup.get("visible_labels", set())
+        if visible:
+            visible_matches = [label for label in labels if label in visible]
+            if visible_matches:
+                return visible_matches[0]
+        if labels:
+            return labels[0]
+        return fallback
+
+    def _format_dynamic_step_mermaid(self,
+                                     control_flow: dict,
+                                     visual_flow: dict,
+                                     active_labels: list[str],
+                                     completed_labels: Optional[list[str]],
+                                     active_edges: Optional[list[tuple[str, str]]],
+                                     completed_edges: Optional[list[tuple[str, str]]],
+                                     caption: str) -> str:
+        active = set(label for label in active_labels if label)
+        completed = set(label for label in (completed_labels or []) if label)
+        active_edge_set = set(edge for edge in (active_edges or []) if edge[0] and edge[1])
+        completed_edge_set = set(edge for edge in (completed_edges or []) if edge[0] and edge[1])
+        if visual_flow.get("kind") == "linear":
+            lines = ["graph LR", '    Start([START])']
+            prev = "Start"
+            edge_index = 0
+            for idx, node in enumerate(visual_flow.get("nodes", []), 1):
+                node_id = f"L{idx}"
+                text = f"{node['title']}<br>{node['description']}"
+                shape = f'(["{text}"])' if node["title"] == "Saída" else f'["{text}"]'
+                lines.append(f"    {node_id}{shape}")
+                lines.append(f"    {prev} --> {node_id}")
+                logical_src = "Start" if idx == 1 else visual_flow.get("nodes", [])[idx - 2].get("label")
+                logical_dst = node.get("label")
+                if (logical_src, logical_dst) in active_edge_set:
+                    lines.append(f"    linkStyle {edge_index} stroke:#d97706,stroke-width:4px;")
+                elif (logical_src, logical_dst) in completed_edge_set:
+                    lines.append(f"    linkStyle {edge_index} stroke:#16a34a,stroke-width:3px;")
+                edge_index += 1
+                prev = node_id
+            lines.append("    Caption[" + '"' + caption.replace('"', "'") + '"' + "]")
+            lines.append(f"    {prev} --> Caption")
+            lines.append("    style Start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#111827;")
+            for idx, node in enumerate(visual_flow.get("nodes", []), 1):
+                node_id = f"L{idx}"
+                label = node.get("label")
+                if label in active:
+                    lines.append(f"    style {node_id} fill:#fef3c7,stroke:#d97706,stroke-width:3px,color:#111827;")
+                elif label in completed:
+                    lines.append(f"    style {node_id} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+                elif node["title"] == "Saída":
+                    lines.append(f"    style {node_id} fill:#e5e7eb,stroke:#94a3b8,stroke-width:1px,color:#111827;")
+                else:
+                    lines.append(f"    style {node_id} fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#111827;")
+            return "\n".join(lines) + "\n"
+
+        node_order = visual_flow.get("nodes", [])
+        alias = {node["label"]: f"N{idx}" for idx, node in enumerate(node_order, 1)}
+        lines = ["graph LR", '    Start([START])']
+        for node in node_order:
+            text = f"{node['title']}<br>{node['description']}"
+            shape = f'(["{text}"])' if "Saída" in node["title"] else f'["{text}"]'
+            lines.append(f"    {alias[node['label']]}{shape}")
+        if node_order:
+            lines.append(f"    Start --> {alias[node_order[0]['label']]}")
+        edge_index = 0
+        if node_order:
+            first_edge = ("Start", node_order[0]["label"])
+            if first_edge in active_edge_set:
+                lines.append(f"    linkStyle {edge_index} stroke:#d97706,stroke-width:4px;")
+            elif first_edge in completed_edge_set:
+                lines.append(f"    linkStyle {edge_index} stroke:#16a34a,stroke-width:3px;")
+            edge_index += 1
+        emitted = set()
+        for edge in control_flow.get("edges", []):
+            src = edge["source"]
+            dst = edge["target"]
+            if src not in alias or dst not in alias:
+                continue
+            key = (src, dst, edge["edge_type"])
+            if key in emitted:
+                continue
+            emitted.add(key)
+            lines.append(f'    {alias[src]} -- "{edge["edge_type"]}" --> {alias[dst]}')
+            if (src, dst) in active_edge_set:
+                lines.append(f"    linkStyle {edge_index} stroke:#d97706,stroke-width:4px;")
+            elif (src, dst) in completed_edge_set:
+                lines.append(f"    linkStyle {edge_index} stroke:#16a34a,stroke-width:3px;")
+            edge_index += 1
+        lines.append("    Caption[" + '"' + caption.replace('"', "'") + '"' + "]")
+        if node_order:
+            lines.append(f"    {alias[node_order[-1]['label']]} --> Caption")
+        lines.append("    style Start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#111827;")
+        for node in node_order:
+            node_id = alias[node["label"]]
+            if node["label"] in active:
+                lines.append(f"    style {node_id} fill:#fef3c7,stroke:#d97706,stroke-width:3px,color:#111827;")
+            elif node["label"] in completed:
+                lines.append(f"    style {node_id} fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#111827;")
+            elif "Saída" in node["title"]:
+                lines.append(f"    style {node_id} fill:#e5e7eb,stroke:#94a3b8,stroke-width:1px,color:#111827;")
+            else:
+                lines.append(f"    style {node_id} fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#111827;")
+        return "\n".join(lines) + "\n"
+
+    def _simulate_smoke_dynamic(self,
+                                sample_input: list[int],
+                                threshold: int,
+                                control_flow: dict,
+                                visual_flow: dict,
+                                threads_per_block: int,
+                                warp_size: int) -> dict:
+        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
+        cfg = analyze_control_flow(self.kernel)
+        branch_site = cfg.branch_sites[0] if cfg.branch_sites else None
+        linear_nodes = visual_flow.get("nodes", []) if visual_flow.get("kind") == "linear" else []
+        entry_label = branch_site.block_label if branch_site else (
+            next((node["label"] for node in linear_nodes if node.get("tag") == "compare"), "__ENTRY__")
+        )
+        taken_label = branch_site.taken_target if branch_site else None
+        fallthrough_label = branch_site.fallthrough_target if branch_site else None
+        linear_select = next((node["label"] for node in linear_nodes if node.get("tag") == "select"), None)
+        linear_update = next((node["label"] for node in linear_nodes if node.get("tag") == "compute"), None)
+        linear_store = next((node["label"] for node in linear_nodes if node.get("tag") == "store"), None)
+        exit_label = branch_site.reconvergence_target if branch_site else (
+            next((node["label"] for node in linear_nodes if node.get("tag") == "exit"), None)
+        )
+        if not exit_label:
+            exit_label = self._resolve_block_from_line(34, lookup)
+
+        threads = []
+        block_hits = Counter()
+        edge_hits = Counter()
+        taken_count = 0
+        fallthrough_count = 0
+        output = []
+        step_frames = []
+
+        for thread_id, value in enumerate(sample_input):
+            path = [entry_label]
+            if value > threshold:
+                taken_count += 1
+                next_label = taken_label or self._resolve_block_from_line(29, lookup)
+                result = value + 1
+                branch_kind = "taken"
+            else:
+                fallthrough_count += 1
+                next_label = fallthrough_label or self._resolve_block_from_line(31, lookup)
+                result = value - 1
+                branch_kind = "fallthrough"
+
+            if next_label:
+                path.append(next_label)
+            elif linear_select:
+                path.append(linear_select)
+                if linear_update:
+                    path.append(linear_update)
+                if linear_store:
+                    path.append(linear_store)
+            if exit_label:
+                path.append(exit_label)
+
+            for label in path:
+                if label:
+                    block_hits[label] += 1
+            for src, dst in zip(path, path[1:]):
+                if src and dst and src != dst:
+                    edge_hits[(src, dst)] += 1
+
+            threads.append({
+                "thread_id": thread_id,
+                "lane": thread_id % warp_size,
+                "warp_id": thread_id // warp_size,
+                "input": value,
+                "output": result,
+                "path": [label for label in path if label],
+                "branch": branch_kind,
+            })
+            output.append(result)
+
+        total_threads = len(sample_input)
+        active_threads = max(taken_count, fallthrough_count)
+        activity_factor = round(active_threads / max(min(total_threads, warp_size), 1), 4)
+        if not branch_site and linear_select:
+            activity_factor = 1.0
+        branch_activity = []
+        if branch_site is not None or linear_select:
+            branch_activity.append({
+                "block_label": branch_site.block_label if branch_site else entry_label,
+                "taken_target": taken_label,
+                "fallthrough_target": fallthrough_label,
+                "taken_count": taken_count,
+                "fallthrough_count": fallthrough_count,
+                "active_threads": min(total_threads, warp_size) if not branch_site and linear_select else active_threads,
+                "warp_size": min(total_threads, warp_size),
+                "activity_factor": activity_factor,
+                "reconvergence_target": exit_label,
+            })
+
+        step_values = {
+            "entrada": list(sample_input),
+            "ajustes": [1 if value > threshold else -1 for value in sample_input],
+            "saida": list(output),
+        }
+        select_label = linear_select or taken_label or fallthrough_label
+        update_label = linear_update or taken_label or fallthrough_label
+        store_label = linear_store or exit_label
+        frame_specs = [
+            {
+                "title": "Entrada dos dados",
+                "active_labels": [entry_label],
+                "completed_labels": [],
+                "active_edges": [("Start", entry_label)],
+                "completed_edges": [],
+                "state": {"dados": step_values["entrada"], "threshold": threshold},
+            },
+            {
+                "title": "Decisão por comparação",
+                "active_labels": [entry_label],
+                "completed_labels": [],
+                "active_edges": [("Start", entry_label)],
+                "completed_edges": [],
+                "state": {
+                    "dados": step_values["entrada"],
+                    "taken_threads": [t["thread_id"] for t in threads if t["branch"] == "taken"],
+                    "fallthrough_threads": [t["thread_id"] for t in threads if t["branch"] == "fallthrough"],
+                },
+            },
+            {
+                "title": "Seleção do ajuste",
+                "active_labels": [select_label],
+                "completed_labels": [entry_label],
+                "active_edges": [(entry_label, select_label)],
+                "completed_edges": [("Start", entry_label)],
+                "state": {"ajustes": step_values["ajustes"]},
+            },
+            {
+                "title": "Aplicação do ajuste",
+                "active_labels": [update_label],
+                "completed_labels": [entry_label, select_label],
+                "active_edges": [(select_label, update_label)],
+                "completed_edges": [("Start", entry_label), (entry_label, select_label)],
+                "state": {"parcial": step_values["saida"]},
+            },
+            {
+                "title": "Escrita do resultado",
+                "active_labels": [store_label],
+                "completed_labels": [entry_label, select_label, update_label],
+                "active_edges": [(update_label, store_label)],
+                "completed_edges": [("Start", entry_label), (entry_label, select_label), (select_label, update_label)],
+                "state": {"saida": step_values["saida"]},
+            },
+            {
+                "title": "Fim do kernel",
+                "active_labels": [exit_label],
+                "completed_labels": [entry_label, select_label, update_label, store_label],
+                "active_edges": [(store_label, exit_label)],
+                "completed_edges": [("Start", entry_label), (entry_label, select_label), (select_label, update_label), (update_label, store_label)],
+                "state": {"saida": step_values["saida"]},
+            },
+        ]
+        for idx, frame in enumerate(frame_specs, 1):
+            caption = f"Etapa {idx}: {frame['title']}"
+            step_frames.append({
+                "step": idx,
+                "title": frame["title"],
+                "active_labels": [label for label in frame["active_labels"] if label],
+                "completed_labels": [label for label in frame.get("completed_labels", []) if label],
+                "active_edges": [edge for edge in frame.get("active_edges", []) if edge[0] and edge[1]],
+                "completed_edges": [edge for edge in frame.get("completed_edges", []) if edge[0] and edge[1]],
+                "state": frame["state"],
+                "mermaid": self._format_dynamic_step_mermaid(
+                    control_flow=control_flow,
+                    visual_flow=visual_flow,
+                    active_labels=[label for label in frame["active_labels"] if label],
+                    completed_labels=[label for label in frame.get("completed_labels", []) if label],
+                    active_edges=[edge for edge in frame.get("active_edges", []) if edge[0] and edge[1]],
+                    completed_edges=[edge for edge in frame.get("completed_edges", []) if edge[0] and edge[1]],
+                    caption=caption,
+                ),
+            })
+
+        return {
+            "model": "source_guided_dynamic_trace",
+            "sample_input": list(sample_input),
+            "sample_output": output,
+            "threads": threads,
+            "block_hits": {label: count for label, count in block_hits.items()},
+            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
+            "branch_activity": branch_activity,
+            "timeline": [],
+            "step_frames": step_frames,
+            "notes": [
+                "Traço dinâmico guiado pelo CFG do PTX e pelo comportamento semântico do kernel.",
+                "Para o microkernel smoke, cada thread executa um único teste e segue um dos dois ramos.",
+                "Quando o PTX é linearizado com predicação, a decisão continua existindo nos dados, mas sem dividir o fluxo de controle do warp.",
+            ],
+        }
+
+    def _simulate_insertion_dynamic(self,
+                                    sample_input: list[int],
+                                    segment_size: int,
+                                    threads_per_block: int,
+                                    warp_size: int,
+                                    control_flow: dict,
+                                    visual_flow: dict) -> dict:
+        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
+        cfg = analyze_control_flow(self.kernel)
+        guard_site = cfg.branch_sites[0] if cfg.branch_sites else None
+        outer_check = self._resolve_block_from_line(43, lookup)
+        key_block = self._resolve_block_from_line(44, lookup)
+        while_check = self._resolve_block_from_line(47, lookup)
+        shift_block = self._resolve_block_from_line(48, lookup)
+        place_block = self._resolve_block_from_line(52, lookup)
+        exit_label = self._resolve_block_from_line(70, lookup) or (visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None)
+
+        threads = []
+        block_hits = Counter()
+        edge_hits = Counter()
+        global_branch_counts: dict[str, dict[str, int]] = {}
+        timeline = []
+        step_frames = []
+        total_elements = len(sample_input)
+        segment_count = (total_elements + segment_size - 1) // segment_size
+
+        def _count_branch(block_label: Optional[str], edge_kind: str) -> None:
+            if not block_label:
+                return
+            item = global_branch_counts.setdefault(block_label, {"taken": 0, "fallthrough": 0})
+            item[edge_kind] += 1
+
+        for thread_id in range(segment_count):
+            base = thread_id * segment_size
+            segment = sample_input[base:base + segment_size]
+            path = []
+            if base + segment_size > total_elements:
+                if guard_site:
+                    path = [guard_site.block_label, guard_site.taken_target]
+                    _count_branch(guard_site.block_label, "taken")
+                threads.append({
+                    "thread_id": thread_id,
+                    "lane": thread_id % warp_size,
+                    "warp_id": thread_id // warp_size,
+                    "segment_in": segment,
+                    "segment_out": segment,
+                    "path": [label for label in path if label],
+                    "inactive": True,
+                })
+                continue
+
+            values = list(segment)
+            if guard_site:
+                path.append(guard_site.block_label)
+                if guard_site.fallthrough_target:
+                    path.append(guard_site.fallthrough_target)
+                _count_branch(guard_site.block_label, "fallthrough")
+
+            for i in range(1, len(values)):
+                if outer_check:
+                    path.append(outer_check)
+                if key_block:
+                    path.append(key_block)
+                key = values[i]
+                j = i - 1
+                while True:
+                    if while_check:
+                        path.append(while_check)
+                    cond = j >= 0 and values[j] > key
+                    _count_branch(while_check, "taken" if cond else "fallthrough")
+                    if not cond:
+                        break
+                    if shift_block:
+                        path.append(shift_block)
+                    values[j + 1] = values[j]
+                    j -= 1
+                if place_block:
+                    path.append(place_block)
+                values[j + 1] = key
+            if exit_label:
+                path.append(exit_label)
+
+            for label in path:
+                if label:
+                    block_hits[label] += 1
+            for src, dst in zip(path, path[1:]):
+                if src and dst and src != dst:
+                    edge_hits[(src, dst)] += 1
+
+            threads.append({
+                "thread_id": thread_id,
+                "lane": thread_id % warp_size,
+                "warp_id": thread_id // warp_size,
+                "segment_in": segment,
+                "segment_out": values,
+                "path": [label for label in path if label],
+                "inactive": False,
+            })
+            timeline.append({
+                "thread_id": thread_id,
+                "comparisons": sum(1 for label in path if label == while_check),
+                "shifts": sum(1 for label in path if label == shift_block),
+                "placements": sum(1 for label in path if label == place_block),
+            })
+            if thread_id == 0 and not threads[-1]["inactive"]:
+                values = list(segment)
+                frame_id = 0
+                step_frames.append({
+                    "step": frame_id + 1,
+                    "title": "Entrada do segmento",
+                    "active_labels": [guard_site.block_label] if guard_site else [],
+                    "completed_labels": [],
+                    "active_edges": [("Start", guard_site.block_label)] if guard_site else [],
+                    "completed_edges": [],
+                    "state": {"segmento": list(values)},
+                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [guard_site.block_label] if guard_site else [], [], [("Start", guard_site.block_label)] if guard_site else [], [], "Etapa 1: entrada do segmento"),
+                })
+                for i in range(1, len(values)):
+                    key = values[i]
+                    j = i - 1
+                    frame_id += 1
+                    step_frames.append({
+                        "step": frame_id + 1,
+                        "title": f"Seleciona chave i={i}",
+                        "active_labels": [outer_check, key_block],
+                        "completed_labels": [guard_site.block_label] if guard_site else [],
+                        "active_edges": [(guard_site.block_label, outer_check), (outer_check, key_block)] if guard_site and outer_check and key_block else [],
+                        "completed_edges": [("Start", guard_site.block_label)] if guard_site else [],
+                        "state": {"segmento": list(values), "key": key, "j": j},
+                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [outer_check, key_block], [guard_site.block_label] if guard_site else [], [(guard_site.block_label, outer_check), (outer_check, key_block)] if guard_site and outer_check and key_block else [], [("Start", guard_site.block_label)] if guard_site else [], f"Etapa {frame_id + 1}: chave i={i}"),
+                    })
+                    while j >= 0 and values[j] > key:
+                        frame_id += 1
+                        step_frames.append({
+                            "step": frame_id + 1,
+                            "title": f"Desloca valor em j={j}",
+                            "active_labels": [while_check, shift_block],
+                            "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block] if label],
+                            "active_edges": [(key_block, while_check), (while_check, shift_block)] if key_block and while_check and shift_block else [],
+                            "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block)] if edge[0] and edge[1]],
+                            "state": {"antes": list(values), "key": key, "j": j},
+                            "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [while_check, shift_block], [label for label in [guard_site.block_label, outer_check, key_block] if label], [(key_block, while_check), (while_check, shift_block)] if key_block and while_check and shift_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: shift em j={j}"),
+                        })
+                        values[j + 1] = values[j]
+                        j -= 1
+                    values[j + 1] = key
+                    frame_id += 1
+                    step_frames.append({
+                        "step": frame_id + 1,
+                        "title": f"Insere chave na posição {j + 1}",
+                        "active_labels": [place_block],
+                        "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block] if label],
+                        "active_edges": [(shift_block, place_block)] if shift_block and place_block else [],
+                        "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block)] if edge[0] and edge[1]],
+                        "state": {"depois": list(values), "key": key, "posicao": j + 1},
+                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [place_block], [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block] if label], [(shift_block, place_block)] if shift_block and place_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: inserção da chave"),
+                    })
+                frame_id += 1
+                step_frames.append({
+                    "step": frame_id + 1,
+                    "title": "Segmento final ordenado",
+                    "active_labels": [exit_label],
+                    "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block, place_block] if label],
+                    "active_edges": [(place_block, exit_label)] if place_block and exit_label else [],
+                    "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block), (shift_block, place_block)] if edge[0] and edge[1]],
+                    "state": {"saida": list(values)},
+                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [exit_label], [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block, place_block] if label], [(place_block, exit_label)] if place_block and exit_label else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block), (shift_block, place_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: fim do segmento"),
+                })
+
+        branch_activity = []
+        for site in cfg.branch_sites:
+            counts = global_branch_counts.get(site.block_label, {"taken": 0, "fallthrough": 0})
+            active_threads = max(counts["taken"], counts["fallthrough"])
+            normalized_active = min(active_threads, min(len(threads), warp_size))
+            branch_activity.append({
+                "block_label": site.block_label,
+                "taken_target": site.taken_target,
+                "fallthrough_target": site.fallthrough_target,
+                "taken_count": counts["taken"],
+                "fallthrough_count": counts["fallthrough"],
+                "active_threads": normalized_active,
+                "warp_size": min(len(threads), warp_size),
+                "activity_factor": round(normalized_active / max(min(len(threads), warp_size), 1), 4),
+                "reconvergence_target": site.reconvergence_target,
+            })
+
+        sample_output = []
+        for item in threads:
+            sample_output.extend(item["segment_out"])
+
+        return {
+            "model": "source_guided_dynamic_trace",
+            "sample_input": list(sample_input),
+            "sample_output": sample_output[:len(sample_input)],
+            "threads": threads,
+            "block_hits": {label: count for label, count in block_hits.items()},
+            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
+            "branch_activity": branch_activity,
+            "timeline": timeline,
+            "step_frames": step_frames,
+            "notes": [
+                "Traço dinâmico aproximado por segmento/thread, projetado sobre os blocos básicos do PTX.",
+                "O laço interno do insertion sort reaparece no caminho dinâmico conforme o número real de deslocamentos.",
+            ],
+        }
+
+    def _simulate_bubble_dynamic(self,
+                                 sample_input: list[int],
+                                 segment_size: int,
+                                 threads_per_block: int,
+                                 warp_size: int,
+                                 control_flow: dict,
+                                 visual_flow: dict) -> dict:
+        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
+        cfg = analyze_control_flow(self.kernel)
+        guard_site = cfg.branch_sites[0] if cfg.branch_sites else None
+        outer_block = self._resolve_block_from_line(50, lookup)
+        inner_block = self._resolve_block_from_line(51, lookup)
+        compare_block = self._resolve_block_from_line(52, lookup)
+        swap_block = self._resolve_block_from_line(53, lookup)
+        exit_label = self._resolve_block_from_line(73, lookup) or (visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None)
+
+        threads = []
+        block_hits = Counter()
+        edge_hits = Counter()
+        global_branch_counts: dict[str, dict[str, int]] = {}
+        timeline = []
+        step_frames = []
+        total_elements = len(sample_input)
+        segment_count = (total_elements + segment_size - 1) // segment_size
+
+        def _count_branch(block_label: Optional[str], edge_kind: str) -> None:
+            if not block_label:
+                return
+            item = global_branch_counts.setdefault(block_label, {"taken": 0, "fallthrough": 0})
+            item[edge_kind] += 1
+
+        for thread_id in range(segment_count):
+            base = thread_id * segment_size
+            segment = sample_input[base:base + segment_size]
+            path = []
+            if base + segment_size > total_elements:
+                if guard_site:
+                    path = [guard_site.block_label, guard_site.taken_target]
+                    _count_branch(guard_site.block_label, "taken")
+                threads.append({
+                    "thread_id": thread_id,
+                    "lane": thread_id % warp_size,
+                    "warp_id": thread_id // warp_size,
+                    "segment_in": segment,
+                    "segment_out": segment,
+                    "path": [label for label in path if label],
+                    "inactive": True,
+                })
+                continue
+
+            values = list(segment)
+            if guard_site:
+                path.append(guard_site.block_label)
+                if guard_site.fallthrough_target:
+                    path.append(guard_site.fallthrough_target)
+                _count_branch(guard_site.block_label, "fallthrough")
+
+            swaps = 0
+            comparisons = 0
+            for end in range(len(values) - 1, 0, -1):
+                if outer_block:
+                    path.append(outer_block)
+                for i in range(0, end):
+                    if inner_block:
+                        path.append(inner_block)
+                    if compare_block:
+                        path.append(compare_block)
+                    comparisons += 1
+                    cond = values[i] > values[i + 1]
+                    _count_branch(compare_block, "taken" if cond else "fallthrough")
+                    if cond:
+                        if swap_block:
+                            path.append(swap_block)
+                        values[i], values[i + 1] = values[i + 1], values[i]
+                        swaps += 1
+            if exit_label:
+                path.append(exit_label)
+
+            for label in path:
+                if label:
+                    block_hits[label] += 1
+            for src, dst in zip(path, path[1:]):
+                if src and dst and src != dst:
+                    edge_hits[(src, dst)] += 1
+
+            threads.append({
+                "thread_id": thread_id,
+                "lane": thread_id % warp_size,
+                "warp_id": thread_id // warp_size,
+                "segment_in": segment,
+                "segment_out": values,
+                "path": [label for label in path if label],
+                "inactive": False,
+            })
+            timeline.append({
+                "thread_id": thread_id,
+                "comparisons": comparisons,
+                "swaps": swaps,
+            })
+            if thread_id == 0 and not threads[-1]["inactive"]:
+                values = list(segment)
+                frame_id = 0
+                step_frames.append({
+                    "step": frame_id + 1,
+                    "title": "Entrada do segmento",
+                    "active_labels": [guard_site.block_label] if guard_site else [],
+                    "completed_labels": [],
+                    "active_edges": [("Start", guard_site.block_label)] if guard_site else [],
+                    "completed_edges": [],
+                    "state": {"segmento": list(values)},
+                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [guard_site.block_label] if guard_site else [], [], [("Start", guard_site.block_label)] if guard_site else [], [], "Etapa 1: entrada do segmento"),
+                })
+                for end in range(len(values) - 1, 0, -1):
+                    frame_id += 1
+                    step_frames.append({
+                        "step": frame_id + 1,
+                        "title": f"Novo passe end={end}",
+                        "active_labels": [outer_block],
+                        "completed_labels": [guard_site.block_label] if guard_site else [],
+                        "active_edges": [(guard_site.block_label, outer_block)] if guard_site and outer_block else [],
+                        "completed_edges": [("Start", guard_site.block_label)] if guard_site else [],
+                        "state": {"segmento": list(values), "end": end},
+                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [outer_block], [guard_site.block_label] if guard_site else [], [(guard_site.block_label, outer_block)] if guard_site and outer_block else [], [("Start", guard_site.block_label)] if guard_site else [], f"Etapa {frame_id + 1}: passe end={end}"),
+                    })
+                    for i in range(0, end):
+                        frame_id += 1
+                        step_frames.append({
+                            "step": frame_id + 1,
+                            "title": f"Compara posições {i} e {i + 1}",
+                            "active_labels": [inner_block, compare_block],
+                            "completed_labels": [label for label in [guard_site.block_label, outer_block] if label],
+                            "active_edges": [(outer_block, inner_block), (inner_block, compare_block)] if outer_block and inner_block and compare_block else [],
+                            "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block)] if edge[0] and edge[1]],
+                            "state": {"segmento": list(values), "i": i, "par": [values[i], values[i + 1]]},
+                            "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [inner_block, compare_block], [label for label in [guard_site.block_label, outer_block] if label], [(outer_block, inner_block), (inner_block, compare_block)] if outer_block and inner_block and compare_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: comparação {i}/{i + 1}"),
+                        })
+                        if values[i] > values[i + 1]:
+                            values[i], values[i + 1] = values[i + 1], values[i]
+                            frame_id += 1
+                            step_frames.append({
+                                "step": frame_id + 1,
+                                "title": f"Swap entre {i} e {i + 1}",
+                                "active_labels": [swap_block],
+                                "completed_labels": [label for label in [guard_site.block_label, outer_block, inner_block, compare_block] if label],
+                                "active_edges": [(compare_block, swap_block)] if compare_block and swap_block else [],
+                                "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block)] if edge[0] and edge[1]],
+                                "state": {"segmento": list(values), "i": i},
+                                "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [swap_block], [label for label in [guard_site.block_label, outer_block, inner_block, compare_block] if label], [(compare_block, swap_block)] if compare_block and swap_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: swap {i}/{i + 1}"),
+                            })
+                frame_id += 1
+                step_frames.append({
+                    "step": frame_id + 1,
+                    "title": "Segmento final ordenado",
+                    "active_labels": [exit_label],
+                    "completed_labels": [label for label in [guard_site.block_label, outer_block, inner_block, compare_block, swap_block] if label],
+                    "active_edges": [(swap_block, exit_label)] if swap_block and exit_label else [],
+                    "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block), (compare_block, swap_block)] if edge[0] and edge[1]],
+                    "state": {"saida": list(values)},
+                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [exit_label], [label for label in [guard_site.block_label, outer_block, inner_block, compare_block, swap_block] if label], [(swap_block, exit_label)] if swap_block and exit_label else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block), (compare_block, swap_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: fim do segmento"),
+                })
+
+        branch_activity = []
+        for site in cfg.branch_sites:
+            counts = global_branch_counts.get(site.block_label, {"taken": 0, "fallthrough": 0})
+            active_threads = max(counts["taken"], counts["fallthrough"])
+            normalized_active = min(active_threads, min(len(threads), warp_size))
+            branch_activity.append({
+                "block_label": site.block_label,
+                "taken_target": site.taken_target,
+                "fallthrough_target": site.fallthrough_target,
+                "taken_count": counts["taken"],
+                "fallthrough_count": counts["fallthrough"],
+                "active_threads": normalized_active,
+                "warp_size": min(len(threads), warp_size),
+                "activity_factor": round(normalized_active / max(min(len(threads), warp_size), 1), 4),
+                "reconvergence_target": site.reconvergence_target,
+            })
+
+        sample_output = []
+        for item in threads:
+            sample_output.extend(item["segment_out"])
+
+        return {
+            "model": "source_guided_dynamic_trace",
+            "sample_input": list(sample_input),
+            "sample_output": sample_output[:len(sample_input)],
+            "threads": threads,
+            "block_hits": {label: count for label, count in block_hits.items()},
+            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
+            "branch_activity": branch_activity,
+            "timeline": timeline,
+            "step_frames": step_frames,
+            "notes": [
+                "Traço dinâmico aproximado por segmento/thread, projetado sobre os blocos básicos do PTX.",
+                "Se o vetor já estiver ordenado, o ramo de swap perde atividade e o fluxo cai preferencialmente no fallthrough.",
+            ],
+        }
+
+    def _format_dynamic_mermaid(self, control_flow: dict, visual_flow: dict, dynamic: dict) -> str:
+        if visual_flow.get("kind") == "linear":
+            lines = ["graph LR", "    Start([START])"]
+            prev = "Start"
+            for idx, node in enumerate(visual_flow.get("nodes", []), 1):
+                node_id = f"L{idx}"
+                hits = dynamic.get("block_hits", {}).get(node.get("label", ""), 0)
+                label = f"{node['title']}<br>{node['description']}<br>hits={hits}"
+                shape = f'(["{label}"])' if node["title"] == "Saída" else f'["{label}"]'
+                lines.append(f"    {node_id}{shape}")
+                lines.append(f"    {prev} --> {node_id}")
+                prev = node_id
+            return "\n".join(lines) + "\n"
+
+        node_order = visual_flow.get("nodes", [])
+        alias = {node["label"]: f"N{idx}" for idx, node in enumerate(node_order, 1)}
+        edge_hits = dynamic.get("edge_hits", {})
+        lines = ["graph LR", "    Start([START])"]
+        for node in node_order:
+            hits = dynamic.get("block_hits", {}).get(node["label"], 0)
+            text = f"{node['title']}<br>{node['description']}<br>hits={hits}"
+            shape = f'(["{text}"])' if "Saída" in node["title"] else f'["{text}"]'
+            lines.append(f"    {alias[node['label']]}{shape}")
+        if node_order:
+            lines.append(f"    Start --> {alias[node_order[0]['label']]}")
+        emitted = set()
+        for edge in control_flow.get("edges", []):
+            src = edge["source"]
+            dst = edge["target"]
+            if src not in alias or dst not in alias:
+                continue
+            key = (src, dst, edge["edge_type"])
+            if key in emitted:
+                continue
+            emitted.add(key)
+            hits = edge_hits.get(f"{src}->{dst}", 0)
+            edge_label = edge["edge_type"]
+            if hits:
+                edge_label = f"{edge_label} | {hits} thread(s)"
+            lines.append(f'    {alias[src]} -- "{edge_label}" --> {alias[dst]}')
+        return "\n".join(lines) + "\n"
+
+    def dynamic_flow(self,
+                     sample_input: list[int],
+                     segment_size: Optional[int] = None,
+                     threads_per_block: int = 32,
+                     threshold: int = 0,
+                     warp_size: int = 32,
+                     mode: str = "data"):
+        mode = mode.lower()
+        control_flow = self._control_flow_data_with_source()
+        visual_flow = self._visual_flow_data()
+        kernel_text = f"{self.kernel.name} {self._source_path or ''} {self._origin_path or ''}".lower()
+
+        if "cfg_ifelse_smoke" in kernel_text:
+            dynamic = self._simulate_smoke_dynamic(
+                sample_input=sample_input,
+                threshold=threshold,
+                control_flow=control_flow,
+                visual_flow=visual_flow,
+                threads_per_block=threads_per_block,
+                warp_size=warp_size,
+            )
+        elif "insertion" in kernel_text:
+            dynamic = self._simulate_insertion_dynamic(
+                sample_input=sample_input,
+                segment_size=segment_size or len(sample_input),
+                threads_per_block=threads_per_block,
+                warp_size=warp_size,
+                control_flow=control_flow,
+                visual_flow=visual_flow,
+            )
+        elif "bubble" in kernel_text:
+            dynamic = self._simulate_bubble_dynamic(
+                sample_input=sample_input,
+                segment_size=segment_size or len(sample_input),
+                threads_per_block=threads_per_block,
+                warp_size=warp_size,
+                control_flow=control_flow,
+                visual_flow=visual_flow,
+            )
+        else:
+            raise ValueError(
+                "Ainda não há simulador dinâmico para este kernel. "
+                "Os casos suportados nesta versão são cfg_ifelse_smoke, insertion e bubble."
+            )
+
+        mermaid = self._format_dynamic_mermaid(control_flow, visual_flow, dynamic)
+        if mode == "data":
+            return {
+                "mermaid": mermaid,
+                "control_flow": control_flow,
+                "visual_flow": visual_flow,
+                "dynamic_flow": dynamic,
+            }
+        if mode == "raw":
+            return mermaid
+        if mode == "text":
+            return emit_text(f"```mermaid\n{mermaid}```", mode="text")
+        raise ValueError(f"Modo desconhecido: {mode}")
 
     def report(self, section: str = "summary", mode: str = "text", max_items: int = 10):
         section = section.lower()
@@ -588,7 +1681,8 @@ class PTXAnalyzer:
         if mode == "data":
             return {
                 "mermaid": graph,
-                "control_flow": analyze_control_flow(self.kernel).to_dict(),
+                "control_flow": self._control_flow_data_with_source(),
+                "visual_flow": self._visual_flow_data(),
             }
         if mode == "raw":
             return graph

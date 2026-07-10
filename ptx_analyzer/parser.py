@@ -34,7 +34,10 @@ def _split_operands(raw: str) -> List[str]:
 
 
 _RE_FILE = re.compile(r'\.file\s+(\d+)\s+"([^"]+)"')
-_RE_LOC  = re.compile(r'\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?')
+_RE_LOC  = re.compile(
+    r'\.loc\s+(\d+)\s+(\d+)(?:\s+(\d+))?'
+    r'(?:,.*?\binlined_at\s+(\d+)\s+(\d+)\s+(\d+))?'
+)
 
 
 def parse_ptx(code: str) -> List[PTXKernel]:
@@ -53,6 +56,36 @@ def parse_ptx(code: str) -> List[PTXKernel]:
     cur_src_file = 0
     cur_src_line = 0
     cur_src_col  = 0
+    cur_inline_src_file = 0
+    cur_inline_src_line = 0
+    cur_inline_src_col = 0
+    pending_stmt_parts: List[str] = []
+    pending_stmt_raw_parts: List[str] = []
+    pending_stmt_lineno = 0
+    pending_stmt_src_file = 0
+    pending_stmt_src_line = 0
+    pending_stmt_src_col = 0
+    pending_stmt_inline_src_file = 0
+    pending_stmt_inline_src_line = 0
+    pending_stmt_inline_src_col = 0
+
+    def _start_multiline_statement(clean_line: str, raw_line: str, lineno: int) -> None:
+        nonlocal pending_stmt_parts, pending_stmt_raw_parts
+        nonlocal pending_stmt_lineno, pending_stmt_src_file, pending_stmt_src_line, pending_stmt_src_col
+        nonlocal pending_stmt_inline_src_file, pending_stmt_inline_src_line, pending_stmt_inline_src_col
+        pending_stmt_parts = [clean_line]
+        pending_stmt_raw_parts = [raw_line.strip()]
+        pending_stmt_lineno = lineno
+        pending_stmt_src_file = cur_src_file
+        pending_stmt_src_line = cur_src_line
+        pending_stmt_src_col = cur_src_col
+        pending_stmt_inline_src_file = cur_inline_src_file
+        pending_stmt_inline_src_line = cur_inline_src_line
+        pending_stmt_inline_src_col = cur_inline_src_col
+
+    def _append_multiline_statement(clean_line: str, raw_line: str) -> None:
+        pending_stmt_parts.append(clean_line)
+        pending_stmt_raw_parts.append(raw_line.strip())
 
     for lineno, raw in enumerate(code.splitlines(), 1):
         line = raw.strip()
@@ -63,6 +96,29 @@ def parse_ptx(code: str) -> List[PTXKernel]:
         line = re.sub(r'//.*$', '', line).strip()
         if not line:
             continue
+
+        if pending_stmt_parts:
+            _append_multiline_statement(line, raw)
+            if ";" not in line:
+                continue
+            line = " ".join(pending_stmt_parts)
+            raw = " ".join(part for part in pending_stmt_raw_parts if part)
+            lineno = pending_stmt_lineno
+            stmt_src_file = pending_stmt_src_file
+            stmt_src_line = pending_stmt_src_line
+            stmt_src_col = pending_stmt_src_col
+            stmt_inline_src_file = pending_stmt_inline_src_file
+            stmt_inline_src_line = pending_stmt_inline_src_line
+            stmt_inline_src_col = pending_stmt_inline_src_col
+            pending_stmt_parts = []
+            pending_stmt_raw_parts = []
+        else:
+            stmt_src_file = cur_src_file
+            stmt_src_line = cur_src_line
+            stmt_src_col = cur_src_col
+            stmt_inline_src_file = cur_inline_src_file
+            stmt_inline_src_line = cur_inline_src_line
+            stmt_inline_src_col = cur_inline_src_col
 
         # .file N "path" — mapeamento de índice para nome de arquivo
         # Pode aparecer em qualquer posição do PTX (dentro ou fora de kernels),
@@ -81,6 +137,9 @@ def parse_ptx(code: str) -> List[PTXKernel]:
             cur_src_file = int(m.group(1))
             cur_src_line = int(m.group(2))
             cur_src_col  = int(m.group(3)) if m.group(3) else 0
+            cur_inline_src_file = int(m.group(4)) if m.group(4) else 0
+            cur_inline_src_line = int(m.group(5)) if m.group(5) else 0
+            cur_inline_src_col = int(m.group(6)) if m.group(6) else 0
             continue
 
         depth += line.count("{") - line.count("}")
@@ -129,6 +188,10 @@ def parse_ptx(code: str) -> List[PTXKernel]:
             pending_label = m.group(1)
             continue
 
+        if ";" not in line and not line.endswith("{") and not line.endswith("}"):
+            _start_multiline_statement(line, raw, lineno)
+            continue
+
         # instrução
         m = _RE_INSTR.match(line)
         if m:
@@ -148,9 +211,12 @@ def parse_ptx(code: str) -> List[PTXKernel]:
                 operands=_split_operands(ops_raw),
                 category=cat,
                 label=pending_label,
-                source_file=cur_src_file,
-                source_line=cur_src_line,
-                source_col =cur_src_col,
+                source_file=stmt_src_file,
+                source_line=stmt_src_line,
+                source_col =stmt_src_col,
+                inline_source_file=stmt_inline_src_file,
+                inline_source_line=stmt_inline_src_line,
+                inline_source_col=stmt_inline_src_col,
             )
             current.instructions.append(instr)
             pending_label = ""
