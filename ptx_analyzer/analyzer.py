@@ -291,8 +291,12 @@ class PTXAnalyzer:
 
     def _format_hotspots_text(self, max_items: int = 10) -> str:
         cfg = analyze_control_flow(self.kernel)
+        # Saltos incondicionais (bra.uni de reconvergência/else) não são decisões
+        # reais e nunca têm risco de divergência: mostrá-los aqui só dilui o
+        # ranking de hotspots com "branches" que não escolhem caminho nenhum.
+        decision_sites = [site for site in cfg.branch_sites if site.branch_kind == "predicated"]
         sites = sorted(
-            cfg.branch_sites,
+            decision_sites,
             key=lambda site: (
                 {"high": 3, "medium": 2, "low": 1, "none": 0}.get(site.divergence_risk, 0),
                 site.taken_memory_ops + site.fallthrough_memory_ops,
@@ -1080,6 +1084,14 @@ class PTXAnalyzer:
                 title = "Limite"
                 instruction_name = "checagem de fronteira"
                 description = "segmento válido"
+            elif compact.startswith(
+                "if (base + segment_size > total_elements || local_thread >= segment_size)"
+            ):
+                # Mesma guarda de fronteira do bloco anterior, só que a variante
+                # shared também descarta threads sem segmento (uma por elemento).
+                title = "Limite"
+                instruction_name = "checagem de fronteira"
+                description = "segmento válido e thread dentro do segmento"
             elif compact.startswith("for (int end = count - 1; end > 0; --end)"):
                 if raw_display_name.startswith("setp"):
                     title = "Laço"
@@ -1351,6 +1363,29 @@ class PTXAnalyzer:
                 lines.append(f"    style {node_id} fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#111827;")
         return "\n".join(lines) + "\n"
 
+    def _walk_single_exit_chain(self, cfg, start: Optional[str], stop: Optional[str]) -> list[str]:
+        """Segue blocos de saída única (fallthrough ou bra.uni estrutural) a partir
+        de `start` até alcançar `stop` (o ponto de reconvergência).
+
+        `taken_target`/`fallthrough_target` de um branch às vezes apontam para um
+        bloco puramente estrutural (ex.: um `bra.uni` que só existe para pular
+        para o alvo real do else), então um único hop não é suficiente para
+        chegar ao bloco de trabalho real antes da reconvergência.
+        """
+        chain: list[str] = []
+        label = start
+        visited: set[str] = set()
+        while label and label not in visited:
+            chain.append(label)
+            visited.add(label)
+            if label == stop:
+                break
+            block = cfg.blocks.get(label)
+            if not block or len(block.exits) != 1:
+                break
+            label = block.exits[0][1]
+        return chain
+
     def _simulate_smoke_dynamic(self,
                                 sample_input: list[int],
                                 threshold: int,
@@ -1398,14 +1433,14 @@ class PTXAnalyzer:
                 branch_kind = "fallthrough"
 
             if next_label:
-                path.append(next_label)
+                path.extend(self._walk_single_exit_chain(cfg, next_label, exit_label))
             elif linear_select:
                 path.append(linear_select)
                 if linear_update:
                     path.append(linear_update)
                 if linear_store:
                     path.append(linear_store)
-            if exit_label:
+            if exit_label and (not path or path[-1] != exit_label):
                 path.append(exit_label)
 
             for label in path:
@@ -1765,7 +1800,17 @@ class PTXAnalyzer:
         inner_block = self._resolve_block_from_line(51, lookup)
         compare_block = self._resolve_block_from_line(52, lookup)
         swap_block = self._resolve_block_from_line(53, lookup)
-        exit_label = self._resolve_block_from_line(73, lookup) or (visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None)
+        # As linhas 50-53 (e 73 abaixo) só existem no layout de bubble_sort_device
+        # de uma versão anterior do kernel. Se nenhuma resolver, esta variante do
+        # kernel foi refatorada e não devemos confiar em uma resolução por linha
+        # de "saída" coincidente — cai para o último nó real do CFG.
+        structural_fallback_exit = (
+            visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None
+        )
+        loop_body_resolved = any([outer_block, inner_block, compare_block, swap_block])
+        exit_label = (
+            self._resolve_block_from_line(73, lookup) if loop_body_resolved else None
+        ) or structural_fallback_exit
 
         threads = []
         block_hits = Counter()
@@ -1826,7 +1871,7 @@ class PTXAnalyzer:
                             path.append(swap_block)
                         values[i], values[i + 1] = values[i + 1], values[i]
                         swaps += 1
-            if exit_label:
+            if exit_label and (not path or path[-1] != exit_label):
                 path.append(exit_label)
 
             for label in path:
@@ -1946,7 +1991,12 @@ class PTXAnalyzer:
             "notes": [
                 "Traço dinâmico aproximado por segmento/thread, projetado sobre os blocos básicos do PTX.",
                 "Se o vetor já estiver ordenado, o ramo de swap perde atividade e o fluxo cai preferencialmente no fallthrough.",
-            ],
+            ] + ([
+                "Esta variante do kernel não teve os blocos de laço/comparação/swap "
+                "localizados pelas linhas de referência internas do simulador — o "
+                "traço mostra apenas a guarda de fronteira e o resultado agregado "
+                "por segmento, sem o detalhamento de comparações/trocas por iteração."
+            ] if not loop_body_resolved else []),
         }
 
     def _format_dynamic_mermaid(self, control_flow: dict, visual_flow: dict, dynamic: dict) -> str:

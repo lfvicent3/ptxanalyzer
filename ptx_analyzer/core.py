@@ -531,7 +531,15 @@ _TERMINATOR_OPS = {"ret", "exit", "brx"}
 
 def _humanize_operand(operand: str) -> str:
     operand = operand.strip()
-    return operand if operand else "valor"
+    if not operand:
+        return "valor"
+    # Nomes de registrador PTX (%r2, %rd13, %p1...) não carregam significado
+    # humano nenhum; expô-los junto do texto explicativo só confunde o leitor
+    # misturando linguagem humana com sintaxe PTX crua. Preservamos apenas
+    # operandos literais (imediatos, símbolos), que de fato ajudam a explicar.
+    if operand.startswith("%"):
+        return ""
+    return operand
 
 
 def explain_instruction(instr: Optional[PTXInstruction]) -> str:
@@ -542,15 +550,15 @@ def explain_instruction(instr: Optional[PTXInstruction]) -> str:
     ops = instr.operands
 
     if op == "setp":
-        if any(token in instr.op for token in (".le.", ".lt.", ".gt.", ".ge.")):
-            if len(ops) >= 3:
-                return (
-                    "Comparando valores para decidir o próximo passo "
-                    f"entre {_humanize_operand(ops[1])} e {_humanize_operand(ops[2])}"
-                )
+        comparatives = any(token in instr.op for token in (".le.", ".lt.", ".gt.", ".ge."))
+        base = "Comparando valores para decidir o próximo passo" if comparatives else "Testando condição"
         if len(ops) >= 3:
-            return f"Testando condição entre {_humanize_operand(ops[1])} e {_humanize_operand(ops[2])}"
-        return "Testando condição"
+            visible = " e ".join(
+                part for part in (_humanize_operand(ops[1]), _humanize_operand(ops[2])) if part
+            )
+            if visible:
+                return f"{base} (com {visible})"
+        return base
     if op == "bra":
         target = ops[-1] if ops else "destino"
         return f"Desvio condicional para {target}" if instr.is_predicated else f"Saltando para {target}"
