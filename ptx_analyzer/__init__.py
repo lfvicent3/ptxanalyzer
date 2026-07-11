@@ -10,6 +10,7 @@ from .utils import compile_to_ptx, analyze_all_ptx, compare_kernels_in_ptx_file
 from .core import (
     PTXKernel,
     PTXInstruction,
+    KernelParamDecl,
     BasicBlock,
     CFGEdge,
     BranchSite,
@@ -34,6 +35,24 @@ from .runtime import (
     parse_benchmark_output,
     load_benchmark_csv,
 )
+from .state import (
+    KernelArg,
+    KernelLaunchConfig,
+    ByteMemory,
+    ThreadContext,
+    Frame,
+    BranchDecision,
+    ThreadTrace,
+    KernelDynamicTrace,
+    UnsupportedInstruction,
+)
+from .interpreter import PTXInterpreter, SUPPORTED_OPCODES
+from .dynamic_view import (
+    render_dynamic_trace_html,
+    show_dynamic_trace_colab,
+    save_dynamic_trace_html,
+    ALL_SECTIONS,
+)
 
 __all__ = [
     "PTXAnalyzer",
@@ -45,6 +64,7 @@ __all__ = [
     "compare_kernels_in_ptx_file",
     "PTXKernel",
     "PTXInstruction",
+    "KernelParamDecl",
     "BasicBlock",
     "CFGEdge",
     "BranchSite",
@@ -66,4 +86,19 @@ __all__ = [
     "profile_cuda_runtime",
     "parse_benchmark_output",
     "load_benchmark_csv",
+    "KernelArg",
+    "KernelLaunchConfig",
+    "ByteMemory",
+    "ThreadContext",
+    "Frame",
+    "BranchDecision",
+    "ThreadTrace",
+    "KernelDynamicTrace",
+    "UnsupportedInstruction",
+    "PTXInterpreter",
+    "SUPPORTED_OPCODES",
+    "render_dynamic_trace_html",
+    "show_dynamic_trace_colab",
+    "save_dynamic_trace_html",
+    "ALL_SECTIONS",
 ]

@@ -5,15 +5,26 @@ Parser PTX.
 import re
 from typing import Dict, List, Optional
 
-from .core import PTXInstruction, PTXKernel, _OP_TO_CAT
+from .core import KernelParamDecl, PTXInstruction, PTXKernel, _OP_TO_CAT
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Parser PTX
 # ──────────────────────────────────────────────────────────────────────────────
 
-_RE_KERNEL  = re.compile(r'\.visible\s+\.entry\s+(\w+)\s*\(')
+_RE_ENTRY   = re.compile(r'^\.visible\s+\.entry\s+(\w+)\s*\(')
+# `.func` declara uma função device auxiliar (não é ponto de entrada). O
+# grupo opcional cobre a assinatura de valor de retorno, ex.:
+# `.func  (.param .b32 func_retval0) nome(`.
+_RE_FUNC    = re.compile(r'^\.(?:visible\s+)?func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(')
+_RE_KERNEL  = _RE_ENTRY  # alias mantido por compatibilidade
 _RE_REG     = re.compile(r'\.reg\s+\.(pred|[bsuf]\d+)\s+(%[\w<>]+)\s*;')
 _RE_PARAM   = re.compile(r'\.param\s+')
+# Declaração individual de parâmetro dentro da lista de assinatura, ex.:
+# `.param .u64 nome_param_0` ou `.param .align 8 .b8 nome_param_0[16]`.
+_RE_PARAM_DECL = re.compile(
+    r'\.param\s+(?:\.align\s+\d+\s+)?\.([A-Za-z0-9]+)\s+'
+    r'([A-Za-z_.$][\w.$]*)(?:\[(\d+)\])?'
+)
 _RE_LABEL   = re.compile(r'^(\$?[\w.]+):')
 _RE_INSTR   = re.compile(
     r'^(?:(@[!]?%\w+)\s+)?'   # predicado opcional
@@ -51,6 +62,8 @@ def parse_ptx(code: str) -> List[PTXKernel]:
     current: Optional[PTXKernel] = None
     pending_label = ""
     inside_kernel = False
+    in_param_list = False
+    param_index = 0
     depth = 0
     global_file_map: Dict[int, str] = {}
     cur_src_file = 0
@@ -144,25 +157,66 @@ def parse_ptx(code: str) -> List[PTXKernel]:
 
         depth += line.count("{") - line.count("}")
 
-        # cabeçalho do kernel
-        m = _RE_KERNEL.match(line)
+        # cabeçalho do kernel (ponto de entrada `.visible .entry`)
+        m = _RE_ENTRY.match(line)
         if m:
-            current = PTXKernel(name=m.group(1), file_map=dict(global_file_map))
+            current = PTXKernel(name=m.group(1), file_map=dict(global_file_map), is_entry_point=True)
             kernels.append(current)
             inside_kernel = True
+            param_index = 0
+            in_param_list = not line.rstrip().endswith(")")
+            continue
+
+        # cabeçalho de função device auxiliar `.func` (não é ponto de
+        # entrada, mas pode ser chamada via `call.uni` a partir de um
+        # kernel — capturada para permitir simulação dinâmica de chamadas
+        # a funções não-inline).
+        m = _RE_FUNC.match(line)
+        if m:
+            current = PTXKernel(name=m.group(1), file_map=dict(global_file_map), is_entry_point=False)
+            kernels.append(current)
+            inside_kernel = True
+            param_index = 0
+            in_param_list = not line.rstrip().endswith(")")
             continue
 
         if not inside_kernel or current is None:
             continue
 
-        # saiu do kernel
+        # saiu do kernel/função
         if depth < 0:
             inside_kernel = False
             depth = 0
             current = None
+            in_param_list = False
             continue
 
-        # parâmetros
+        # lista de parâmetros da assinatura (posição + tipo, na ordem em
+        # que aparecem no PTX) — é isso que o executor dinâmico genérico
+        # usa para saber o que o kernel espera receber, sem depender do
+        # nome do kernel/algoritmo.
+        if in_param_list:
+            m = _RE_PARAM_DECL.search(line)
+            if m:
+                ptx_type, param_name, array_size = m.group(1), m.group(2), m.group(3)
+                current.params.append(KernelParamDecl(
+                    index=param_index,
+                    name=param_name,
+                    ptx_type=ptx_type,
+                    array_size=int(array_size) if array_size else None,
+                ))
+                current.param_count += 1
+                param_index += 1
+                continue
+            in_param_list = False
+            # a linha que fecha a lista (ex.: ")" ou ") {") não carrega
+            # mais nada relevante para o parser — segue para o restante
+            # do laço apenas por segurança, mas normalmente não casa com
+            # nenhum outro padrão abaixo.
+
+        # `.param` fora da lista de assinatura: declarações locais de
+        # chamada (`.param .b32 param0;` dentro de um callseq) — contam
+        # para métricas legadas, mas não fazem parte da assinatura.
         if _RE_PARAM.search(line):
             current.param_count += line.count(".param")
             continue

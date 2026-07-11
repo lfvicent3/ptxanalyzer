@@ -9,10 +9,11 @@ import os
 import re
 import subprocess
 from collections import Counter, deque
-from typing import Optional
+from typing import Optional, Union
 
 from .core import PTXKernel, analyze_control_flow, explain_instruction, _block_primary_source_line
-from .output import emit_text, mermaid_block_html
+from .interpreter import PTXInterpreter
+from .output import emit_text
 from .parser import parse_ptx
 from .ptxas import parse_ptxas_output
 from .runtime import (
@@ -22,6 +23,7 @@ from .runtime import (
     parse_benchmark_output,
     profile_cuda_runtime,
 )
+from .state import KernelArg, KernelLaunchConfig, Number
 
 
 def _bar(n: int, max_n: int, width: int = 28) -> str:
@@ -40,6 +42,26 @@ def _normalize_kernel_name(name: str) -> str:
     return name.strip().rstrip(":")
 
 
+_RE_ITANIUM_NAME_PREFIX = re.compile(r'^_Z(\d+)')
+
+
+def _demangled_kernel_name(name: str) -> str:
+    """Extrai o nome "amigável" (sem mangling C++) de um símbolo PTX.
+
+    Kernels `__global__` têm linkage C++ por padrão (portanto mangled no
+    PTX), a menos que sejam declarados `extern "C"`. Isto usa o prefixo de
+    comprimento do Itanium ABI (`_Z<N><identificador>...`) para isolar o
+    nome original — não decodifica namespaces/templates, só o identificador
+    da função, que é suficiente para casar com o nome usado no `.cu`.
+    """
+    match = _RE_ITANIUM_NAME_PREFIX.match(name)
+    if not match:
+        return name
+    length = int(match.group(1))
+    rest = name[match.end():]
+    return rest[:length] if len(rest) >= length else name
+
+
 class PTXAnalyzer:
     """
     Interface principal de análise de um kernel PTX.
@@ -56,9 +78,15 @@ class PTXAnalyzer:
                  kernel_index: int = 0,
                  kernel_name: Optional[str] = None):
         self._code = code
-        kernels = parse_ptx(code)
+        units = parse_ptx(code)
+        # `parse_ptx` também captura funções device auxiliares (`.func`,
+        # chamadas via `call.uni`) — elas não são pontos de entrada e não
+        # entram na seleção de kernel, mas o executor dinâmico genérico
+        # precisa delas para resolver chamadas (ver `dynamic_flow`).
+        kernels = [unit for unit in units if unit.is_entry_point]
         if not kernels:
             raise ValueError("Nenhum kernel encontrado no PTX fornecido.")
+        self._all_units = units
         self._all_kernels = kernels
         selected_index = self._resolve_kernel_index(kernels, kernel_index, kernel_name)
         self.kernel = kernels[selected_index]
@@ -78,7 +106,16 @@ class PTXAnalyzer:
             for idx, kernel in enumerate(kernels):
                 if _normalize_kernel_name(kernel.name) == normalized_target:
                     return idx
-            available = ", ".join(_normalize_kernel_name(kernel.name) for kernel in kernels)
+            # Fallback: casa pelo nome "amigável" (sem mangling C++), já
+            # que o nome usado no .cu raramente é o símbolo mangled do PTX.
+            for idx, kernel in enumerate(kernels):
+                if _demangled_kernel_name(kernel.name) == normalized_target:
+                    return idx
+            available = ", ".join(
+                kernel.name if _demangled_kernel_name(kernel.name) == kernel.name
+                else f"{kernel.name} ({_demangled_kernel_name(kernel.name)})"
+                for kernel in kernels
+            )
             raise ValueError(
                 f"Kernel {kernel_name!r} não encontrado. Disponíveis: {available}"
             )
@@ -1233,41 +1270,6 @@ class PTXAnalyzer:
             "nodes": nodes,
         }
 
-    def _dynamic_block_lookup(self, control_flow: dict, visual_flow: dict) -> dict:
-        line_to_labels: dict[int, list[str]] = {}
-        for label in control_flow.get("order", []):
-            block = control_flow["blocks"][label]
-            line_no = int(block.get("source_line", 0) or 0)
-            if line_no <= 0:
-                continue
-            line_to_labels.setdefault(line_no, []).append(label)
-
-        visible_labels = set()
-        if visual_flow.get("kind") == "cfg":
-            visible_labels = {node["label"] for node in visual_flow.get("nodes", [])}
-        else:
-            for node in visual_flow.get("nodes", []):
-                line_no = int(node.get("source_line", 0) or 0)
-                label = node.get("label")
-                if line_no > 0 and label:
-                    line_to_labels.setdefault(line_no, []).append(label)
-                    visible_labels.add(label)
-        return {
-            "line_to_labels": line_to_labels,
-            "visible_labels": visible_labels,
-        }
-
-    def _resolve_block_from_line(self, line_no: int, lookup: dict, fallback: Optional[str] = None) -> Optional[str]:
-        labels = list(lookup.get("line_to_labels", {}).get(line_no, []))
-        visible = lookup.get("visible_labels", set())
-        if visible:
-            visible_matches = [label for label in labels if label in visible]
-            if visible_matches:
-                return visible_matches[0]
-        if labels:
-            return labels[0]
-        return fallback
-
     def _format_dynamic_step_mermaid(self,
                                      control_flow: dict,
                                      visual_flow: dict,
@@ -1363,642 +1365,6 @@ class PTXAnalyzer:
                 lines.append(f"    style {node_id} fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#111827;")
         return "\n".join(lines) + "\n"
 
-    def _walk_single_exit_chain(self, cfg, start: Optional[str], stop: Optional[str]) -> list[str]:
-        """Segue blocos de saída única (fallthrough ou bra.uni estrutural) a partir
-        de `start` até alcançar `stop` (o ponto de reconvergência).
-
-        `taken_target`/`fallthrough_target` de um branch às vezes apontam para um
-        bloco puramente estrutural (ex.: um `bra.uni` que só existe para pular
-        para o alvo real do else), então um único hop não é suficiente para
-        chegar ao bloco de trabalho real antes da reconvergência.
-        """
-        chain: list[str] = []
-        label = start
-        visited: set[str] = set()
-        while label and label not in visited:
-            chain.append(label)
-            visited.add(label)
-            if label == stop:
-                break
-            block = cfg.blocks.get(label)
-            if not block or len(block.exits) != 1:
-                break
-            label = block.exits[0][1]
-        return chain
-
-    def _simulate_smoke_dynamic(self,
-                                sample_input: list[int],
-                                threshold: int,
-                                control_flow: dict,
-                                visual_flow: dict,
-                                threads_per_block: int,
-                                warp_size: int) -> dict:
-        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
-        cfg = analyze_control_flow(self.kernel)
-        branch_site = cfg.branch_sites[0] if cfg.branch_sites else None
-        linear_nodes = visual_flow.get("nodes", []) if visual_flow.get("kind") == "linear" else []
-        entry_label = branch_site.block_label if branch_site else (
-            next((node["label"] for node in linear_nodes if node.get("tag") == "compare"), "__ENTRY__")
-        )
-        taken_label = branch_site.taken_target if branch_site else None
-        fallthrough_label = branch_site.fallthrough_target if branch_site else None
-        linear_select = next((node["label"] for node in linear_nodes if node.get("tag") == "select"), None)
-        linear_update = next((node["label"] for node in linear_nodes if node.get("tag") == "compute"), None)
-        linear_store = next((node["label"] for node in linear_nodes if node.get("tag") == "store"), None)
-        exit_label = branch_site.reconvergence_target if branch_site else (
-            next((node["label"] for node in linear_nodes if node.get("tag") == "exit"), None)
-        )
-        if not exit_label:
-            exit_label = self._resolve_block_from_line(34, lookup)
-
-        threads = []
-        block_hits = Counter()
-        edge_hits = Counter()
-        taken_count = 0
-        fallthrough_count = 0
-        output = []
-        step_frames = []
-
-        for thread_id, value in enumerate(sample_input):
-            path = [entry_label]
-            if value > threshold:
-                taken_count += 1
-                next_label = taken_label or self._resolve_block_from_line(29, lookup)
-                result = value + 1
-                branch_kind = "taken"
-            else:
-                fallthrough_count += 1
-                next_label = fallthrough_label or self._resolve_block_from_line(31, lookup)
-                result = value - 1
-                branch_kind = "fallthrough"
-
-            if next_label:
-                path.extend(self._walk_single_exit_chain(cfg, next_label, exit_label))
-            elif linear_select:
-                path.append(linear_select)
-                if linear_update:
-                    path.append(linear_update)
-                if linear_store:
-                    path.append(linear_store)
-            if exit_label and (not path or path[-1] != exit_label):
-                path.append(exit_label)
-
-            for label in path:
-                if label:
-                    block_hits[label] += 1
-            for src, dst in zip(path, path[1:]):
-                if src and dst and src != dst:
-                    edge_hits[(src, dst)] += 1
-
-            threads.append({
-                "thread_id": thread_id,
-                "lane": thread_id % warp_size,
-                "warp_id": thread_id // warp_size,
-                "input": value,
-                "output": result,
-                "path": [label for label in path if label],
-                "branch": branch_kind,
-            })
-            output.append(result)
-
-        total_threads = len(sample_input)
-        active_threads = max(taken_count, fallthrough_count)
-        activity_factor = round(active_threads / max(min(total_threads, warp_size), 1), 4)
-        if not branch_site and linear_select:
-            activity_factor = 1.0
-        branch_activity = []
-        if branch_site is not None or linear_select:
-            branch_activity.append({
-                "block_label": branch_site.block_label if branch_site else entry_label,
-                "taken_target": taken_label,
-                "fallthrough_target": fallthrough_label,
-                "taken_count": taken_count,
-                "fallthrough_count": fallthrough_count,
-                "active_threads": min(total_threads, warp_size) if not branch_site and linear_select else active_threads,
-                "warp_size": min(total_threads, warp_size),
-                "activity_factor": activity_factor,
-                "reconvergence_target": exit_label,
-            })
-
-        step_values = {
-            "entrada": list(sample_input),
-            "ajustes": [1 if value > threshold else -1 for value in sample_input],
-            "saida": list(output),
-        }
-        select_label = linear_select or taken_label or fallthrough_label
-        update_label = linear_update or taken_label or fallthrough_label
-        store_label = linear_store or exit_label
-        frame_specs = [
-            {
-                "title": "Entrada dos dados",
-                "active_labels": [entry_label],
-                "completed_labels": [],
-                "active_edges": [("Start", entry_label)],
-                "completed_edges": [],
-                "state": {"dados": step_values["entrada"], "threshold": threshold},
-            },
-            {
-                "title": "Decisão por comparação",
-                "active_labels": [entry_label],
-                "completed_labels": [],
-                "active_edges": [("Start", entry_label)],
-                "completed_edges": [],
-                "state": {
-                    "dados": step_values["entrada"],
-                    "taken_threads": [t["thread_id"] for t in threads if t["branch"] == "taken"],
-                    "fallthrough_threads": [t["thread_id"] for t in threads if t["branch"] == "fallthrough"],
-                },
-            },
-            {
-                "title": "Seleção do ajuste",
-                "active_labels": [select_label],
-                "completed_labels": [entry_label],
-                "active_edges": [(entry_label, select_label)],
-                "completed_edges": [("Start", entry_label)],
-                "state": {"ajustes": step_values["ajustes"]},
-            },
-            {
-                "title": "Aplicação do ajuste",
-                "active_labels": [update_label],
-                "completed_labels": [entry_label, select_label],
-                "active_edges": [(select_label, update_label)],
-                "completed_edges": [("Start", entry_label), (entry_label, select_label)],
-                "state": {"parcial": step_values["saida"]},
-            },
-            {
-                "title": "Escrita do resultado",
-                "active_labels": [store_label],
-                "completed_labels": [entry_label, select_label, update_label],
-                "active_edges": [(update_label, store_label)],
-                "completed_edges": [("Start", entry_label), (entry_label, select_label), (select_label, update_label)],
-                "state": {"saida": step_values["saida"]},
-            },
-            {
-                "title": "Fim do kernel",
-                "active_labels": [exit_label],
-                "completed_labels": [entry_label, select_label, update_label, store_label],
-                "active_edges": [(store_label, exit_label)],
-                "completed_edges": [("Start", entry_label), (entry_label, select_label), (select_label, update_label), (update_label, store_label)],
-                "state": {"saida": step_values["saida"]},
-            },
-        ]
-        for idx, frame in enumerate(frame_specs, 1):
-            caption = f"Etapa {idx}: {frame['title']}"
-            step_frames.append({
-                "step": idx,
-                "title": frame["title"],
-                "active_labels": [label for label in frame["active_labels"] if label],
-                "completed_labels": [label for label in frame.get("completed_labels", []) if label],
-                "active_edges": [edge for edge in frame.get("active_edges", []) if edge[0] and edge[1]],
-                "completed_edges": [edge for edge in frame.get("completed_edges", []) if edge[0] and edge[1]],
-                "state": frame["state"],
-                "mermaid": self._format_dynamic_step_mermaid(
-                    control_flow=control_flow,
-                    visual_flow=visual_flow,
-                    active_labels=[label for label in frame["active_labels"] if label],
-                    completed_labels=[label for label in frame.get("completed_labels", []) if label],
-                    active_edges=[edge for edge in frame.get("active_edges", []) if edge[0] and edge[1]],
-                    completed_edges=[edge for edge in frame.get("completed_edges", []) if edge[0] and edge[1]],
-                    caption=caption,
-                ),
-            })
-
-        return {
-            "model": "source_guided_dynamic_trace",
-            "sample_input": list(sample_input),
-            "sample_output": output,
-            "threads": threads,
-            "block_hits": {label: count for label, count in block_hits.items()},
-            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
-            "branch_activity": branch_activity,
-            "timeline": [],
-            "step_frames": step_frames,
-            "notes": [
-                "Traço dinâmico guiado pelo CFG do PTX e pelo comportamento semântico do kernel.",
-                "Para o microkernel smoke, cada thread executa um único teste e segue um dos dois ramos.",
-                "Quando o PTX é linearizado com predicação, a decisão continua existindo nos dados, mas sem dividir o fluxo de controle do warp.",
-            ],
-        }
-
-    def _simulate_insertion_dynamic(self,
-                                    sample_input: list[int],
-                                    segment_size: int,
-                                    threads_per_block: int,
-                                    warp_size: int,
-                                    control_flow: dict,
-                                    visual_flow: dict) -> dict:
-        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
-        cfg = analyze_control_flow(self.kernel)
-        guard_site = cfg.branch_sites[0] if cfg.branch_sites else None
-        outer_check = self._resolve_block_from_line(43, lookup)
-        key_block = self._resolve_block_from_line(44, lookup)
-        while_check = self._resolve_block_from_line(47, lookup)
-        shift_block = self._resolve_block_from_line(48, lookup)
-        place_block = self._resolve_block_from_line(52, lookup)
-        exit_label = self._resolve_block_from_line(70, lookup) or (visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None)
-
-        threads = []
-        block_hits = Counter()
-        edge_hits = Counter()
-        global_branch_counts: dict[str, dict[str, int]] = {}
-        timeline = []
-        step_frames = []
-        total_elements = len(sample_input)
-        segment_count = (total_elements + segment_size - 1) // segment_size
-
-        def _count_branch(block_label: Optional[str], edge_kind: str) -> None:
-            if not block_label:
-                return
-            item = global_branch_counts.setdefault(block_label, {"taken": 0, "fallthrough": 0})
-            item[edge_kind] += 1
-
-        for thread_id in range(segment_count):
-            base = thread_id * segment_size
-            segment = sample_input[base:base + segment_size]
-            path = []
-            if base + segment_size > total_elements:
-                if guard_site:
-                    path = [guard_site.block_label, guard_site.taken_target]
-                    _count_branch(guard_site.block_label, "taken")
-                threads.append({
-                    "thread_id": thread_id,
-                    "lane": thread_id % warp_size,
-                    "warp_id": thread_id // warp_size,
-                    "segment_in": segment,
-                    "segment_out": segment,
-                    "path": [label for label in path if label],
-                    "inactive": True,
-                })
-                continue
-
-            values = list(segment)
-            if guard_site:
-                path.append(guard_site.block_label)
-                if guard_site.fallthrough_target:
-                    path.append(guard_site.fallthrough_target)
-                _count_branch(guard_site.block_label, "fallthrough")
-
-            for i in range(1, len(values)):
-                if outer_check:
-                    path.append(outer_check)
-                if key_block:
-                    path.append(key_block)
-                key = values[i]
-                j = i - 1
-                while True:
-                    if while_check:
-                        path.append(while_check)
-                    cond = j >= 0 and values[j] > key
-                    _count_branch(while_check, "taken" if cond else "fallthrough")
-                    if not cond:
-                        break
-                    if shift_block:
-                        path.append(shift_block)
-                    values[j + 1] = values[j]
-                    j -= 1
-                if place_block:
-                    path.append(place_block)
-                values[j + 1] = key
-            if exit_label:
-                path.append(exit_label)
-
-            for label in path:
-                if label:
-                    block_hits[label] += 1
-            for src, dst in zip(path, path[1:]):
-                if src and dst and src != dst:
-                    edge_hits[(src, dst)] += 1
-
-            threads.append({
-                "thread_id": thread_id,
-                "lane": thread_id % warp_size,
-                "warp_id": thread_id // warp_size,
-                "segment_in": segment,
-                "segment_out": values,
-                "path": [label for label in path if label],
-                "inactive": False,
-            })
-            timeline.append({
-                "thread_id": thread_id,
-                "comparisons": sum(1 for label in path if label == while_check),
-                "shifts": sum(1 for label in path if label == shift_block),
-                "placements": sum(1 for label in path if label == place_block),
-            })
-            if thread_id == 0 and not threads[-1]["inactive"]:
-                values = list(segment)
-                frame_id = 0
-                step_frames.append({
-                    "step": frame_id + 1,
-                    "title": "Entrada do segmento",
-                    "active_labels": [guard_site.block_label] if guard_site else [],
-                    "completed_labels": [],
-                    "active_edges": [("Start", guard_site.block_label)] if guard_site else [],
-                    "completed_edges": [],
-                    "state": {"segmento": list(values)},
-                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [guard_site.block_label] if guard_site else [], [], [("Start", guard_site.block_label)] if guard_site else [], [], "Etapa 1: entrada do segmento"),
-                })
-                for i in range(1, len(values)):
-                    key = values[i]
-                    j = i - 1
-                    frame_id += 1
-                    step_frames.append({
-                        "step": frame_id + 1,
-                        "title": f"Seleciona chave i={i}",
-                        "active_labels": [outer_check, key_block],
-                        "completed_labels": [guard_site.block_label] if guard_site else [],
-                        "active_edges": [(guard_site.block_label, outer_check), (outer_check, key_block)] if guard_site and outer_check and key_block else [],
-                        "completed_edges": [("Start", guard_site.block_label)] if guard_site else [],
-                        "state": {"segmento": list(values), "key": key, "j": j},
-                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [outer_check, key_block], [guard_site.block_label] if guard_site else [], [(guard_site.block_label, outer_check), (outer_check, key_block)] if guard_site and outer_check and key_block else [], [("Start", guard_site.block_label)] if guard_site else [], f"Etapa {frame_id + 1}: chave i={i}"),
-                    })
-                    while j >= 0 and values[j] > key:
-                        frame_id += 1
-                        step_frames.append({
-                            "step": frame_id + 1,
-                            "title": f"Desloca valor em j={j}",
-                            "active_labels": [while_check, shift_block],
-                            "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block] if label],
-                            "active_edges": [(key_block, while_check), (while_check, shift_block)] if key_block and while_check and shift_block else [],
-                            "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block)] if edge[0] and edge[1]],
-                            "state": {"antes": list(values), "key": key, "j": j},
-                            "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [while_check, shift_block], [label for label in [guard_site.block_label, outer_check, key_block] if label], [(key_block, while_check), (while_check, shift_block)] if key_block and while_check and shift_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: shift em j={j}"),
-                        })
-                        values[j + 1] = values[j]
-                        j -= 1
-                    values[j + 1] = key
-                    frame_id += 1
-                    step_frames.append({
-                        "step": frame_id + 1,
-                        "title": f"Insere chave na posição {j + 1}",
-                        "active_labels": [place_block],
-                        "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block] if label],
-                        "active_edges": [(shift_block, place_block)] if shift_block and place_block else [],
-                        "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block)] if edge[0] and edge[1]],
-                        "state": {"depois": list(values), "key": key, "posicao": j + 1},
-                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [place_block], [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block] if label], [(shift_block, place_block)] if shift_block and place_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: inserção da chave"),
-                    })
-                frame_id += 1
-                step_frames.append({
-                    "step": frame_id + 1,
-                    "title": "Segmento final ordenado",
-                    "active_labels": [exit_label],
-                    "completed_labels": [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block, place_block] if label],
-                    "active_edges": [(place_block, exit_label)] if place_block and exit_label else [],
-                    "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block), (shift_block, place_block)] if edge[0] and edge[1]],
-                    "state": {"saida": list(values)},
-                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [exit_label], [label for label in [guard_site.block_label, outer_check, key_block, while_check, shift_block, place_block] if label], [(place_block, exit_label)] if place_block and exit_label else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_check), (outer_check, key_block), (key_block, while_check), (while_check, shift_block), (shift_block, place_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: fim do segmento"),
-                })
-
-        branch_activity = []
-        for site in cfg.branch_sites:
-            counts = global_branch_counts.get(site.block_label, {"taken": 0, "fallthrough": 0})
-            active_threads = max(counts["taken"], counts["fallthrough"])
-            normalized_active = min(active_threads, min(len(threads), warp_size))
-            branch_activity.append({
-                "block_label": site.block_label,
-                "taken_target": site.taken_target,
-                "fallthrough_target": site.fallthrough_target,
-                "taken_count": counts["taken"],
-                "fallthrough_count": counts["fallthrough"],
-                "active_threads": normalized_active,
-                "warp_size": min(len(threads), warp_size),
-                "activity_factor": round(normalized_active / max(min(len(threads), warp_size), 1), 4),
-                "reconvergence_target": site.reconvergence_target,
-            })
-
-        sample_output = []
-        for item in threads:
-            sample_output.extend(item["segment_out"])
-
-        return {
-            "model": "source_guided_dynamic_trace",
-            "sample_input": list(sample_input),
-            "sample_output": sample_output[:len(sample_input)],
-            "threads": threads,
-            "block_hits": {label: count for label, count in block_hits.items()},
-            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
-            "branch_activity": branch_activity,
-            "timeline": timeline,
-            "step_frames": step_frames,
-            "notes": [
-                "Traço dinâmico aproximado por segmento/thread, projetado sobre os blocos básicos do PTX.",
-                "O laço interno do insertion sort reaparece no caminho dinâmico conforme o número real de deslocamentos.",
-            ],
-        }
-
-    def _simulate_bubble_dynamic(self,
-                                 sample_input: list[int],
-                                 segment_size: int,
-                                 threads_per_block: int,
-                                 warp_size: int,
-                                 control_flow: dict,
-                                 visual_flow: dict) -> dict:
-        lookup = self._dynamic_block_lookup(control_flow, visual_flow)
-        cfg = analyze_control_flow(self.kernel)
-        guard_site = cfg.branch_sites[0] if cfg.branch_sites else None
-        outer_block = self._resolve_block_from_line(50, lookup)
-        inner_block = self._resolve_block_from_line(51, lookup)
-        compare_block = self._resolve_block_from_line(52, lookup)
-        swap_block = self._resolve_block_from_line(53, lookup)
-        # As linhas 50-53 (e 73 abaixo) só existem no layout de bubble_sort_device
-        # de uma versão anterior do kernel. Se nenhuma resolver, esta variante do
-        # kernel foi refatorada e não devemos confiar em uma resolução por linha
-        # de "saída" coincidente — cai para o último nó real do CFG.
-        structural_fallback_exit = (
-            visual_flow.get("nodes", [{}])[-1].get("label") if visual_flow.get("nodes") else None
-        )
-        loop_body_resolved = any([outer_block, inner_block, compare_block, swap_block])
-        exit_label = (
-            self._resolve_block_from_line(73, lookup) if loop_body_resolved else None
-        ) or structural_fallback_exit
-
-        threads = []
-        block_hits = Counter()
-        edge_hits = Counter()
-        global_branch_counts: dict[str, dict[str, int]] = {}
-        timeline = []
-        step_frames = []
-        total_elements = len(sample_input)
-        segment_count = (total_elements + segment_size - 1) // segment_size
-
-        def _count_branch(block_label: Optional[str], edge_kind: str) -> None:
-            if not block_label:
-                return
-            item = global_branch_counts.setdefault(block_label, {"taken": 0, "fallthrough": 0})
-            item[edge_kind] += 1
-
-        for thread_id in range(segment_count):
-            base = thread_id * segment_size
-            segment = sample_input[base:base + segment_size]
-            path = []
-            if base + segment_size > total_elements:
-                if guard_site:
-                    path = [guard_site.block_label, guard_site.taken_target]
-                    _count_branch(guard_site.block_label, "taken")
-                threads.append({
-                    "thread_id": thread_id,
-                    "lane": thread_id % warp_size,
-                    "warp_id": thread_id // warp_size,
-                    "segment_in": segment,
-                    "segment_out": segment,
-                    "path": [label for label in path if label],
-                    "inactive": True,
-                })
-                continue
-
-            values = list(segment)
-            if guard_site:
-                path.append(guard_site.block_label)
-                if guard_site.fallthrough_target:
-                    path.append(guard_site.fallthrough_target)
-                _count_branch(guard_site.block_label, "fallthrough")
-
-            swaps = 0
-            comparisons = 0
-            for end in range(len(values) - 1, 0, -1):
-                if outer_block:
-                    path.append(outer_block)
-                for i in range(0, end):
-                    if inner_block:
-                        path.append(inner_block)
-                    if compare_block:
-                        path.append(compare_block)
-                    comparisons += 1
-                    cond = values[i] > values[i + 1]
-                    _count_branch(compare_block, "taken" if cond else "fallthrough")
-                    if cond:
-                        if swap_block:
-                            path.append(swap_block)
-                        values[i], values[i + 1] = values[i + 1], values[i]
-                        swaps += 1
-            if exit_label and (not path or path[-1] != exit_label):
-                path.append(exit_label)
-
-            for label in path:
-                if label:
-                    block_hits[label] += 1
-            for src, dst in zip(path, path[1:]):
-                if src and dst and src != dst:
-                    edge_hits[(src, dst)] += 1
-
-            threads.append({
-                "thread_id": thread_id,
-                "lane": thread_id % warp_size,
-                "warp_id": thread_id // warp_size,
-                "segment_in": segment,
-                "segment_out": values,
-                "path": [label for label in path if label],
-                "inactive": False,
-            })
-            timeline.append({
-                "thread_id": thread_id,
-                "comparisons": comparisons,
-                "swaps": swaps,
-            })
-            if thread_id == 0 and not threads[-1]["inactive"]:
-                values = list(segment)
-                frame_id = 0
-                step_frames.append({
-                    "step": frame_id + 1,
-                    "title": "Entrada do segmento",
-                    "active_labels": [guard_site.block_label] if guard_site else [],
-                    "completed_labels": [],
-                    "active_edges": [("Start", guard_site.block_label)] if guard_site else [],
-                    "completed_edges": [],
-                    "state": {"segmento": list(values)},
-                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [guard_site.block_label] if guard_site else [], [], [("Start", guard_site.block_label)] if guard_site else [], [], "Etapa 1: entrada do segmento"),
-                })
-                for end in range(len(values) - 1, 0, -1):
-                    frame_id += 1
-                    step_frames.append({
-                        "step": frame_id + 1,
-                        "title": f"Novo passe end={end}",
-                        "active_labels": [outer_block],
-                        "completed_labels": [guard_site.block_label] if guard_site else [],
-                        "active_edges": [(guard_site.block_label, outer_block)] if guard_site and outer_block else [],
-                        "completed_edges": [("Start", guard_site.block_label)] if guard_site else [],
-                        "state": {"segmento": list(values), "end": end},
-                        "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [outer_block], [guard_site.block_label] if guard_site else [], [(guard_site.block_label, outer_block)] if guard_site and outer_block else [], [("Start", guard_site.block_label)] if guard_site else [], f"Etapa {frame_id + 1}: passe end={end}"),
-                    })
-                    for i in range(0, end):
-                        frame_id += 1
-                        step_frames.append({
-                            "step": frame_id + 1,
-                            "title": f"Compara posições {i} e {i + 1}",
-                            "active_labels": [inner_block, compare_block],
-                            "completed_labels": [label for label in [guard_site.block_label, outer_block] if label],
-                            "active_edges": [(outer_block, inner_block), (inner_block, compare_block)] if outer_block and inner_block and compare_block else [],
-                            "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block)] if edge[0] and edge[1]],
-                            "state": {"segmento": list(values), "i": i, "par": [values[i], values[i + 1]]},
-                            "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [inner_block, compare_block], [label for label in [guard_site.block_label, outer_block] if label], [(outer_block, inner_block), (inner_block, compare_block)] if outer_block and inner_block and compare_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: comparação {i}/{i + 1}"),
-                        })
-                        if values[i] > values[i + 1]:
-                            values[i], values[i + 1] = values[i + 1], values[i]
-                            frame_id += 1
-                            step_frames.append({
-                                "step": frame_id + 1,
-                                "title": f"Swap entre {i} e {i + 1}",
-                                "active_labels": [swap_block],
-                                "completed_labels": [label for label in [guard_site.block_label, outer_block, inner_block, compare_block] if label],
-                                "active_edges": [(compare_block, swap_block)] if compare_block and swap_block else [],
-                                "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block)] if edge[0] and edge[1]],
-                                "state": {"segmento": list(values), "i": i},
-                                "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [swap_block], [label for label in [guard_site.block_label, outer_block, inner_block, compare_block] if label], [(compare_block, swap_block)] if compare_block and swap_block else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: swap {i}/{i + 1}"),
-                            })
-                frame_id += 1
-                step_frames.append({
-                    "step": frame_id + 1,
-                    "title": "Segmento final ordenado",
-                    "active_labels": [exit_label],
-                    "completed_labels": [label for label in [guard_site.block_label, outer_block, inner_block, compare_block, swap_block] if label],
-                    "active_edges": [(swap_block, exit_label)] if swap_block and exit_label else [],
-                    "completed_edges": [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block), (compare_block, swap_block)] if edge[0] and edge[1]],
-                    "state": {"saida": list(values)},
-                    "mermaid": self._format_dynamic_step_mermaid(control_flow, visual_flow, [exit_label], [label for label in [guard_site.block_label, outer_block, inner_block, compare_block, swap_block] if label], [(swap_block, exit_label)] if swap_block and exit_label else [], [edge for edge in [("Start", guard_site.block_label if guard_site else None), (guard_site.block_label if guard_site else None, outer_block), (outer_block, inner_block), (inner_block, compare_block), (compare_block, swap_block)] if edge[0] and edge[1]], f"Etapa {frame_id + 1}: fim do segmento"),
-                })
-
-        branch_activity = []
-        for site in cfg.branch_sites:
-            counts = global_branch_counts.get(site.block_label, {"taken": 0, "fallthrough": 0})
-            active_threads = max(counts["taken"], counts["fallthrough"])
-            normalized_active = min(active_threads, min(len(threads), warp_size))
-            branch_activity.append({
-                "block_label": site.block_label,
-                "taken_target": site.taken_target,
-                "fallthrough_target": site.fallthrough_target,
-                "taken_count": counts["taken"],
-                "fallthrough_count": counts["fallthrough"],
-                "active_threads": normalized_active,
-                "warp_size": min(len(threads), warp_size),
-                "activity_factor": round(normalized_active / max(min(len(threads), warp_size), 1), 4),
-                "reconvergence_target": site.reconvergence_target,
-            })
-
-        sample_output = []
-        for item in threads:
-            sample_output.extend(item["segment_out"])
-
-        return {
-            "model": "source_guided_dynamic_trace",
-            "sample_input": list(sample_input),
-            "sample_output": sample_output[:len(sample_input)],
-            "threads": threads,
-            "block_hits": {label: count for label, count in block_hits.items()},
-            "edge_hits": {f"{src}->{dst}": count for (src, dst), count in edge_hits.items()},
-            "branch_activity": branch_activity,
-            "timeline": timeline,
-            "step_frames": step_frames,
-            "notes": [
-                "Traço dinâmico aproximado por segmento/thread, projetado sobre os blocos básicos do PTX.",
-                "Se o vetor já estiver ordenado, o ramo de swap perde atividade e o fluxo cai preferencialmente no fallthrough.",
-            ] + ([
-                "Esta variante do kernel não teve os blocos de laço/comparação/swap "
-                "localizados pelas linhas de referência internas do simulador — o "
-                "traço mostra apenas a guarda de fronteira e o resultado agregado "
-                "por segmento, sem o detalhamento de comparações/trocas por iteração."
-            ] if not loop_body_resolved else []),
-        }
-
     def _format_dynamic_mermaid(self, control_flow: dict, visual_flow: dict, dynamic: dict) -> str:
         if visual_flow.get("kind") == "linear":
             lines = ["graph LR", "    Start([START])"]
@@ -2041,49 +1407,88 @@ class PTXAnalyzer:
             lines.append(f'    {alias[src]} -- "{edge_label}" --> {alias[dst]}')
         return "\n".join(lines) + "\n"
 
+    def _function_map(self) -> dict:
+        """Funções device (`.func`) disponíveis no mesmo PTX, indexadas
+        pelo nome mangled — usadas pelo executor genérico para resolver
+        `call.uni` a partir do kernel de entrada."""
+        return {unit.name: unit for unit in self._all_units if not unit.is_entry_point}
+
     def dynamic_flow(self,
-                     sample_input: list[int],
-                     segment_size: Optional[int] = None,
-                     threads_per_block: int = 32,
-                     threshold: int = 0,
+                     kernel_args: Optional[Union[dict, list]] = None,
+                     kernel_name: Optional[str] = None,
+                     grid_dim: Optional[tuple[int, int, int]] = None,
+                     block_dim: Optional[tuple[int, int, int]] = None,
                      warp_size: int = 32,
+                     max_threads: int = 4096,
+                     max_steps: int = 200_000,
+                     expected_output: Optional[dict[str, list]] = None,
                      mode: str = "data"):
+        """Executa o modo dinâmico de forma genérica: interpreta o PTX de
+        verdade (via `ptx_analyzer.interpreter.PTXInterpreter`) sobre os
+        parâmetros/buffers concretos informados em `kernel_args`, para a
+        configuração de grid/block dada. Não há nenhuma ramificação por
+        nome de kernel/algoritmo aqui — o mesmo código atende qualquer
+        kernel cujas instruções estejam dentro do subconjunto suportado
+        (ver `ptx_analyzer.interpreter.SUPPORTED_OPCODES`).
+
+        Uso comum (`kernel_args` como dict simples — a ordem das chaves
+        define a posição do parâmetro na assinatura PTX, e listas/tuplas
+        viram buffers automaticamente)::
+
+            analyzer.dynamic_flow(
+                kernel_name="bubble_sort_global_kernel",
+                kernel_args={"data": [4, 2, 1, 3], "total_elements": 4, "segment_size": 4},
+                grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+            )
+
+        Uso avançado (controle fino de largura/sinal/tipo de cada buffer):
+        passe uma `list[KernelArg]` em `kernel_args`, como antes.
+
+        `kernel_name`, se informado e diferente do kernel atual, seleciona
+        outro `.visible .entry` do mesmo arquivo (equivalente a chamar
+        `select_kernel(kernel_name=...)` antes).
+
+        `expected_output`, se fornecido, mapeia rótulo de buffer (a chave
+        usada em `kernel_args`, ou `param_<indice>` se um `list[KernelArg]`
+        sem `label` foi passado) para os valores esperados, e o resultado
+        inclui uma comparação honesta em `dynamic_flow["validation"]`.
+        """
+        if kernel_name and _normalize_kernel_name(kernel_name) != _normalize_kernel_name(self.kernel.name):
+            return self.select_kernel(kernel_name=kernel_name).dynamic_flow(
+                kernel_args=kernel_args,
+                grid_dim=grid_dim,
+                block_dim=block_dim,
+                warp_size=warp_size,
+                max_threads=max_threads,
+                max_steps=max_steps,
+                expected_output=expected_output,
+                mode=mode,
+            )
+
         mode = mode.lower()
+        resolved_args = self._resolve_kernel_args(kernel_args)
+        dims_omitted = grid_dim is None and block_dim is None
+        resolved_grid_dim = grid_dim or (1, 1, 1)
+        resolved_block_dim = block_dim or (1, 1, 1)
+
         control_flow = self._control_flow_data_with_source()
         visual_flow = self._visual_flow_data()
-        kernel_text = f"{self.kernel.name} {self._source_path or ''} {self._origin_path or ''}".lower()
-
-        if "cfg_ifelse_smoke" in kernel_text:
-            dynamic = self._simulate_smoke_dynamic(
-                sample_input=sample_input,
-                threshold=threshold,
-                control_flow=control_flow,
-                visual_flow=visual_flow,
-                threads_per_block=threads_per_block,
-                warp_size=warp_size,
-            )
-        elif "insertion" in kernel_text:
-            dynamic = self._simulate_insertion_dynamic(
-                sample_input=sample_input,
-                segment_size=segment_size or len(sample_input),
-                threads_per_block=threads_per_block,
-                warp_size=warp_size,
-                control_flow=control_flow,
-                visual_flow=visual_flow,
-            )
-        elif "bubble" in kernel_text:
-            dynamic = self._simulate_bubble_dynamic(
-                sample_input=sample_input,
-                segment_size=segment_size or len(sample_input),
-                threads_per_block=threads_per_block,
-                warp_size=warp_size,
-                control_flow=control_flow,
-                visual_flow=visual_flow,
-            )
-        else:
-            raise ValueError(
-                "Ainda não há simulador dinâmico para este kernel. "
-                "Os casos suportados nesta versão são cfg_ifelse_smoke, insertion e bubble."
+        dynamic = self._simulate_generic_dynamic(
+            kernel_args=resolved_args,
+            grid_dim=resolved_grid_dim,
+            block_dim=resolved_block_dim,
+            warp_size=warp_size,
+            max_threads=max_threads,
+            max_steps=max_steps,
+            expected_output=expected_output,
+            control_flow=control_flow,
+            visual_flow=visual_flow,
+        )
+        if dims_omitted:
+            dynamic["notes"].insert(0,
+                "grid_dim/block_dim não informados — assumindo (1, 1, 1) (uma única "
+                "thread). Se o kernel espera uma thread por elemento/segmento, informe "
+                "grid_dim/block_dim explicitamente."
             )
 
         mermaid = self._format_dynamic_mermaid(control_flow, visual_flow, dynamic)
@@ -2099,6 +1504,397 @@ class PTXAnalyzer:
         if mode == "text":
             return emit_text(f"```mermaid\n{mermaid}```", mode="text")
         raise ValueError(f"Modo desconhecido: {mode}")
+
+    def dynamic_trace_html(self,
+                           kernel_args: Optional[Union[dict, list]] = None,
+                           grid_dim: Optional[tuple[int, int, int]] = None,
+                           block_dim: Optional[tuple[int, int, int]] = None,
+                           warp_size: int = 32,
+                           max_threads: int = 4096,
+                           max_steps: int = 200_000,
+                           expected_output: Optional[dict[str, list]] = None,
+                           sections: Optional[list[str]] = None,
+                           height: str = "480px",
+                           title: Optional[str] = None) -> str:
+        """Executa `dynamic_flow(...)` e devolve o HTML interativo e
+        navegável por passo (grafo, threads/warps, memória, E/S, linha do
+        tempo das threads e código do kernel — ver
+        `ptx_analyzer.dynamic_view` para o design por trás disso).
+
+        `sections`, se informado, restringe quais blocos aparecem — um
+        subconjunto de `dynamic_view.ALL_SECTIONS` =
+        ("graph", "threads", "memory", "io", "timeline", "code"); por
+        padrão (`None`) mostra a visão completa. Útil pra embutir só um
+        pedaço (ex.: `sections=["graph"]` pra só o grafo, ou
+        `sections=["timeline", "code"]` pra dispensar o grafo).
+
+        Uso em Colab/Jupyter:
+
+            from IPython.display import HTML
+            HTML(kernel.dynamic_trace_html(kernel_args=..., grid_dim=..., block_dim=...))
+
+        ou direto com `kernel.show_dynamic_trace(...)`.
+        """
+        from .dynamic_view import render_dynamic_trace_html
+
+        result = self.dynamic_flow(
+            kernel_args=kernel_args,
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            warp_size=warp_size,
+            max_threads=max_threads,
+            max_steps=max_steps,
+            expected_output=expected_output,
+            mode="data",
+        )
+        return render_dynamic_trace_html(
+            result,
+            title=title or f"{self.kernel.name} — traço dinâmico",
+            warp_size=warp_size,
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            source_path=self.source_path,
+            kernel_name=self.friendly_kernel_name,
+            sections=sections,
+            height=height,
+        )
+
+    def show_dynamic_trace(self, **kwargs) -> None:
+        """Chama `dynamic_trace_html(**kwargs)` e exibe via
+        `IPython.display.HTML` — uso direto em uma célula do Colab/Jupyter:
+
+            kernel.show_dynamic_trace(kernel_args=..., grid_dim=..., block_dim=...)
+        """
+        from .dynamic_view import render_dynamic_trace_iframe_html
+        from IPython.display import HTML, display
+        result = self.dynamic_flow(
+            kernel_args=kwargs.get("kernel_args"),
+            grid_dim=kwargs.get("grid_dim"),
+            block_dim=kwargs.get("block_dim"),
+            warp_size=kwargs.get("warp_size", 32),
+            max_threads=kwargs.get("max_threads", 4096),
+            max_steps=kwargs.get("max_steps", 200_000),
+            expected_output=kwargs.get("expected_output"),
+            mode="data",
+        )
+        display(HTML(render_dynamic_trace_iframe_html(
+            result,
+            title=kwargs.get("title") or f"{self.kernel.name} — traço dinâmico",
+            warp_size=kwargs.get("warp_size", 32),
+            grid_dim=kwargs.get("grid_dim"),
+            block_dim=kwargs.get("block_dim"),
+            height=kwargs.get("height", "480px"),
+            source_path=self.source_path,
+            kernel_name=self.friendly_kernel_name,
+            sections=kwargs.get("sections"),
+        )))
+
+    def control_flow_html(self, sections: Optional[list[str]] = None, height: str = "480px") -> str:
+        """Visão estática do CFG (sem executar nada), no mesmo grafo
+        (Cytoscape.js + dagre) usado pelo traço dinâmico — mesmos nós e
+        arestas, só sem dados de execução (threads=0, sem heat/timeline
+        úteis). Substitui o antigo grafo Mermaid usado por
+        `control_flow(mode="html")`, que tinha problemas reais de
+        escala/fit no Colab (ver docstring de `ptx_analyzer.dynamic_view`
+        pra detalhes do porquê).
+
+        `sections` por padrão mostra só `["graph"]` (não há threads pra
+        preencher os outros painéis numa visão puramente estática); passe
+        explicitamente pra incluir outros (ex.: `sections=["graph","code"]`).
+        """
+        from .dynamic_view import render_dynamic_trace_html
+
+        result = {"control_flow": self._control_flow_data_with_source()}
+        return render_dynamic_trace_html(
+            result,
+            title=f"{self.kernel.name} — CFG estático",
+            source_path=self.source_path,
+            kernel_name=self.friendly_kernel_name,
+            sections=sections if sections is not None else ["graph"],
+            height=height,
+        )
+
+    def _kernel_display_name(self) -> str:
+        """Nome do kernel para mensagens de erro: prefere o nome "amigável"
+        (sem mangling C++) quando ele existe e difere do símbolo PTX cru."""
+        demangled = _demangled_kernel_name(self.kernel.name)
+        if demangled != self.kernel.name:
+            return f"{demangled} ({self.kernel.name})"
+        return self.kernel.name
+
+    def _resolve_kernel_args(self, kernel_args: Optional[Union[dict, list]]) -> list[KernelArg]:
+        """Aceita tanto o formato ergonômico (`dict {rótulo: valor}`, com
+        listas/tuplas viram buffers e escalares viram `int`/`float`) quanto
+        o formato de baixo nível (`list[KernelArg]`, para controle fino de
+        largura/sinal/tipo). Sempre valida contra `self.kernel.params`
+        (a assinatura real, extraída do PTX) antes de seguir."""
+        if kernel_args is None:
+            kernel_args = {}
+
+        if isinstance(kernel_args, dict):
+            resolved = self._kernel_args_from_dict(kernel_args)
+        elif isinstance(kernel_args, list) and all(isinstance(item, KernelArg) for item in kernel_args):
+            resolved = list(kernel_args)
+        else:
+            raise TypeError(
+                "kernel_args deve ser um dict {rótulo: valor} (uso comum: listas/tuplas "
+                "viram buffers, int/float viram escalares) ou uma list[KernelArg] (uso "
+                f"avançado). Recebido: {type(kernel_args).__name__}."
+            )
+
+        self._validate_kernel_args(resolved)
+        return resolved
+
+    def _kernel_args_from_dict(self, kernel_args: dict) -> list[KernelArg]:
+        declared = self.kernel.params
+        resolved: list[KernelArg] = []
+        for position, (label, value) in enumerate(kernel_args.items()):
+            decl = declared[position] if position < len(declared) else None
+            looks_like_pointer = decl is not None and decl.ptx_type == "u64"
+
+            if isinstance(value, (list, tuple)):
+                if decl is not None and not looks_like_pointer:
+                    raise ValueError(
+                        f"parâmetro {position} ({label!r}) do kernel {self._kernel_display_name()} é "
+                        f"escalar (.{decl.ptx_type}), mas foi passada uma lista/tupla — "
+                        "buffers só fazem sentido em parâmetros de ponteiro (tipicamente .u64)."
+                    )
+                resolved.append(KernelArg(index=position, kind="buffer", values=list(value), label=label))
+            elif isinstance(value, bool):
+                raise TypeError(f"parâmetro {label!r}: bool não é um argumento de kernel válido.")
+            elif isinstance(value, (int, float)):
+                if looks_like_pointer:
+                    raise ValueError(
+                        f"parâmetro {position} ({label!r}) do kernel {self._kernel_display_name()} espera "
+                        f"um ponteiro (.{decl.ptx_type}), mas foi passado um escalar ({value!r}) — "
+                        "passe uma lista/tupla de valores para esse parâmetro."
+                    )
+                resolved.append(KernelArg(index=position, kind="scalar", value=value, label=label))
+            else:
+                raise TypeError(
+                    f"parâmetro {label!r}: tipo {type(value).__name__} não suportado; "
+                    "use int/float para escalares ou list/tuple para buffers."
+                )
+        return resolved
+
+    def _validate_kernel_args(self, resolved: list[KernelArg]) -> None:
+        declared = self.kernel.params
+        if not declared:
+            return  # assinatura não capturada pelo parser (raro) — nada a validar
+        provided = {arg.index: arg for arg in resolved}
+        missing = [decl for decl in declared if decl.index not in provided]
+        if missing:
+            details = ", ".join(f"posição {decl.index} (.{decl.ptx_type})" for decl in missing)
+            raise ValueError(
+                f"faltando argumento(s) para o kernel {self._kernel_display_name()}: {details}. "
+                f"A assinatura tem {len(declared)} parâmetro(s) — confira a ordem/quantidade "
+                "de chaves em kernel_args (analyzer.kernel.params mostra a assinatura completa)."
+            )
+        extra = sorted(idx for idx in provided if idx >= len(declared))
+        if extra:
+            raise ValueError(
+                f"kernel {self._kernel_display_name()} tem apenas {len(declared)} parâmetro(s), mas "
+                f"foram informados argumentos nas posições extras {extra} — remova-os de kernel_args."
+            )
+
+    def _simulate_generic_dynamic(self,
+                                  kernel_args: list[KernelArg],
+                                  grid_dim: tuple[int, int, int],
+                                  block_dim: tuple[int, int, int],
+                                  warp_size: int,
+                                  max_threads: int,
+                                  max_steps: int,
+                                  expected_output: Optional[dict[str, list]],
+                                  control_flow: dict,
+                                  visual_flow: dict) -> dict:
+        interpreter = PTXInterpreter(
+            self.kernel,
+            functions=self._function_map(),
+            raw_ptx=self._code,
+            max_steps=max_steps,
+        )
+        interpreter.load_args(kernel_args)
+        launch = KernelLaunchConfig(grid_dim=grid_dim, block_dim=block_dim, warp_size=warp_size)
+        ktrace = interpreter.run(launch, max_threads=max_threads)
+
+        threads = [
+            {
+                "thread_id": t.thread_id,
+                "tid": list(t.tid),
+                "ctaid": list(t.ctaid),
+                "lane": t.thread_id % warp_size,
+                "warp_id": t.thread_id // warp_size,
+                "path": list(t.blocks_visited),
+                "edges": [list(edge) for edge in t.edges_taken],
+                "branch_decisions": [bd.to_dict() for bd in t.branch_decisions],
+                "halt_reason": t.halt_reason,
+                "unsupported_ops": list(t.unsupported_ops),
+            }
+            for t in ktrace.threads
+        ]
+
+        # Atividade por branch: agregada a partir das decisões REAIS de
+        # cada thread (não estimada por heurística de algoritmo).
+        branch_totals: dict = {}
+        for t in ktrace.threads:
+            for bd in t.branch_decisions:
+                item = branch_totals.setdefault(bd.block_label, {
+                    "taken": 0, "fallthrough": 0,
+                    "taken_target": bd.taken_target,
+                    "fallthrough_target": bd.fallthrough_target,
+                })
+                if bd.taken_target is not None and bd.chosen_target == bd.taken_target:
+                    item["taken"] += 1
+                else:
+                    item["fallthrough"] += 1
+
+        cfg = analyze_control_flow(self.kernel)
+        reconvergence = {site.block_label: site.reconvergence_target for site in cfg.branch_sites}
+        total_threads = max(len(ktrace.threads), 1)
+        branch_activity = []
+        for label, counts in branch_totals.items():
+            active_threads = max(counts["taken"], counts["fallthrough"])
+            warp_population = min(total_threads, warp_size)
+            normalized = min(active_threads, warp_population)
+            branch_activity.append({
+                "block_label": label,
+                "taken_target": counts["taken_target"],
+                "fallthrough_target": counts["fallthrough_target"],
+                "taken_count": counts["taken"],
+                "fallthrough_count": counts["fallthrough"],
+                "active_threads": normalized,
+                "warp_size": warp_population,
+                "activity_factor": round(normalized / max(warp_population, 1), 4),
+                "reconvergence_target": reconvergence.get(label),
+            })
+
+        buffers_before = {
+            ktrace.buffer_labels.get(idx, f"param_{idx}"): vals
+            for idx, vals in ktrace.buffers_before.items()
+        }
+        buffers_after = {
+            ktrace.buffer_labels.get(idx, f"param_{idx}"): vals
+            for idx, vals in ktrace.buffers_after.items()
+        }
+
+        validation = []
+        if expected_output:
+            for label, expected in expected_output.items():
+                actual = buffers_after.get(label)
+                validation.append({
+                    "buffer": label,
+                    "expected": list(expected),
+                    "actual": actual,
+                    "match": actual == list(expected),
+                })
+
+        notes = [
+            "Traço dinâmico obtido executando o PTX real (executor genérico, não uma "
+            "heurística por algoritmo): cada thread simulada percorre o CFG a partir dos "
+            "valores concretos fornecidos, avaliando predicados/branches de verdade.",
+            "Threads são executadas sequencialmente (sem concorrência real); "
+            "bar.sync/membar são tratados como marcadores, não como barreiras de fato — "
+            "kernels que dependem de __syncthreads() para dividir trabalho entre threads "
+            "de um mesmo bloco podem produzir saída divergente da GPU real (ver docstring "
+            "de ptx_analyzer.interpreter).",
+        ]
+        if ktrace.unsupported_ops:
+            notes.append(
+                "Instruções fora do subconjunto suportado hoje foram encontradas e "
+                f"interromperam a(s) thread(s) nesse ponto: {', '.join(ktrace.unsupported_ops)}."
+            )
+        if expected_output:
+            if all(item["match"] for item in validation):
+                notes.append("Saída simulada bate com a saída esperada informada.")
+            else:
+                notes.append("Divergência entre saída simulada e saída esperada — ver 'validation'.")
+        else:
+            notes.append("Nenhuma saída esperada foi fornecida para validação automática.")
+
+        step_frames = self._build_generic_step_frames(ktrace, control_flow, visual_flow)
+
+        return {
+            "model": "generic_ptx_cfg_trace",
+            "sample_input": buffers_before,
+            "sample_output": buffers_after,
+            "threads": threads,
+            "block_hits": dict(ktrace.block_hits),
+            "edge_hits": dict(ktrace.edge_hits),
+            "branch_activity": branch_activity,
+            "timeline": [],
+            "step_frames": step_frames,
+            "validation": validation,
+            "unsupported_ops": list(ktrace.unsupported_ops),
+            "notes": notes,
+        }
+
+    def _build_generic_step_frames(self,
+                                   ktrace,
+                                   control_flow: dict,
+                                   visual_flow: dict,
+                                   max_frames: int = 120) -> list:
+        """Um quadro por bloco visitado por uma thread representativa
+        (normalmente a de índice 0), com o conteúdo real dos buffers
+        naquele ponto da execução — não uma reconstrução manual do
+        algoritmo, e sim o que a memória simulada de fato continha."""
+        snapshot_trace = next((t for t in ktrace.threads if t.block_snapshots), None)
+        if snapshot_trace is None:
+            return []
+
+        snapshots = snapshot_trace.block_snapshots[:max_frames]
+        frames = []
+        prev_label = None
+        completed_labels: list = []
+        completed_edges: list = []
+        for idx, (label, buffers) in enumerate(snapshots, 1):
+            active_edges = [(prev_label, label)] if prev_label else []
+            state = {
+                ktrace.buffer_labels.get(buf_idx, f"param_{buf_idx}"): vals
+                for buf_idx, vals in buffers.items()
+            }
+            frames.append({
+                "step": idx,
+                "title": f"Bloco {label}",
+                "active_labels": [label],
+                "completed_labels": list(completed_labels),
+                "active_edges": list(active_edges),
+                "completed_edges": list(completed_edges),
+                "state": state,
+                "mermaid": self._format_dynamic_step_mermaid(
+                    control_flow=control_flow,
+                    visual_flow=visual_flow,
+                    active_labels=[label],
+                    completed_labels=list(completed_labels),
+                    active_edges=list(active_edges),
+                    completed_edges=list(completed_edges),
+                    caption=f"Etapa {idx}: bloco {label}",
+                ),
+            })
+            if prev_label:
+                completed_edges.append((prev_label, label))
+            completed_labels.append(label)
+            prev_label = label
+
+        if len(snapshot_trace.block_snapshots) > max_frames:
+            frames.append({
+                "step": len(frames) + 1,
+                "title": "Traço truncado",
+                "active_labels": [],
+                "completed_labels": list(completed_labels),
+                "active_edges": [],
+                "completed_edges": list(completed_edges),
+                "state": {"nota": f"exibindo apenas os primeiros {max_frames} blocos visitados"},
+                "mermaid": self._format_dynamic_step_mermaid(
+                    control_flow=control_flow,
+                    visual_flow=visual_flow,
+                    active_labels=[],
+                    completed_labels=list(completed_labels),
+                    active_edges=[],
+                    completed_edges=list(completed_edges),
+                    caption="Traço truncado",
+                ),
+            })
+        return frames
 
     def report(self, section: str = "summary", mode: str = "text", max_items: int = 10):
         section = section.lower()
@@ -2161,12 +1957,33 @@ class PTXAnalyzer:
             return emit_text(f"```mermaid\n{graph}```", mode="text")
         if mode == "html":
             try:
+                from .dynamic_view import render_dynamic_trace_iframe_html
                 from IPython.display import HTML, display
-                display(HTML(mermaid_block_html(graph, title=self.kernel.name)))
+                display(HTML(render_dynamic_trace_iframe_html(
+                    {"control_flow": self._control_flow_data_with_source()},
+                    title=f"{self.kernel.name} — CFG estático",
+                    source_path=self.source_path,
+                    kernel_name=self.friendly_kernel_name,
+                    sections=["graph"],
+                )))
                 return None
             except Exception:
                 return emit_text(f"```mermaid\n{graph}```", mode="text")
         raise ValueError(f"Modo desconhecido: {mode}")
+
+    @property
+    def source_path(self) -> Optional[str]:
+        """Caminho absoluto do .cu associado a este kernel, se localizado
+        ou compilado (mesma resolução usada para anotar `source_line`
+        nos blocos do CFG). `None` se não houver fonte CUDA disponível."""
+        return self._infer_source_path()
+
+    @property
+    def friendly_kernel_name(self) -> str:
+        """Nome do kernel como aparece escrito no `.cu` (sem mangling C++
+        do símbolo PTX) — o que precisa pra localizar a função certa
+        dentro do arquivo-fonte quando ele tem mais de um kernel."""
+        return _demangled_kernel_name(self.kernel.name)
 
     @property
     def kernel_count(self) -> int:

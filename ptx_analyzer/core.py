@@ -277,11 +277,37 @@ class PTXASInfo:
 
 
 @dataclass
+class KernelParamDecl:
+    """Declaração de um parâmetro tal como aparece na assinatura PTX
+    (`.visible .entry NOME(.param .TYPE nome_param_N, ...)`).
+
+    Isso é derivado do próprio PTX (posição + tipo), nunca do nome do
+    kernel ou do algoritmo — é a base genérica usada pelo executor
+    dinâmico para saber quantos parâmetros existem e de que tipo, sem
+    precisar conhecer o kernel de antemão.
+    """
+    index: int
+    name: str
+    ptx_type: str                 # ex.: "u64", "u32", "f32", "b8"
+    array_size: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "name": self.name,
+            "ptx_type": self.ptx_type,
+            "array_size": self.array_size,
+        }
+
+
+@dataclass
 class PTXKernel:
     name: str
     instructions: List[PTXInstruction] = field(default_factory=list)
     reg_decls: Dict[str, Set[str]] = field(default_factory=dict)
     param_count: int = 0
+    params: List[KernelParamDecl] = field(default_factory=list)
+    is_entry_point: bool = True   # False para `.func` (funções device auxiliares)
     file_map: Dict[int, str] = field(default_factory=dict)  # idx → path do .cu
     ptxas_info: Optional[PTXASInfo] = None
 

@@ -7,6 +7,7 @@ O foco agora é:
 - extrair métricas do próprio PTX
 - extrair métricas reais do `ptxas`
 - gerar fluxo de controle em Mermaid para Colab
+- gerar fluxo de controle em Mermaid com descrições humanas por bloco
 - ligar kernels PTX/CUDA aos resultados de benchmark
 
 ## Uso rápido
@@ -23,6 +24,19 @@ a.report(section="benchmark")
 a.hotspots_report()
 a.flowchart(mode="html")
 ```
+
+## Validação rápida do parser
+
+Para depurar o CFG sem o ruído dos algoritmos de ordenação, use o microkernel
+`kernels/cfg_ifelse_smoke.cu`, que contém apenas um `if/else` com soma e
+subtração:
+
+```bash
+python3 scripts/debug_cfg_smoke.py
+```
+
+Esse script compila o `.cu`, roda o analisador e imprime o Mermaid junto com os
+blocos anotados em linguagem humana.
 
 ## API principal
 

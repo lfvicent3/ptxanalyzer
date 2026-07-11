@@ -5,7 +5,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from ptx_analyzer import PTXAnalyzer, build_cfg
+from ptx_analyzer import KernelArg, PTXAnalyzer, build_cfg
 
 
 SIMPLE_IF_ELSE_PTX = r"""
@@ -26,6 +26,47 @@ SIMPLE_IF_ELSE_PTX = r"""
 $L_then:
     add.s32 %r4, %r1, 1;
 $L_end:
+    ret;
+}
+"""
+
+# Variante do smoke test com assinatura PTX real (dois ponteiros + um
+# escalar) e ld.param/ld.global/st.global de verdade, para exercitar o
+# executor dinâmico genérico (ptx_analyzer.interpreter) fim a fim, sem
+# depender de nvcc/CUDA no ambiente de teste.
+PARAM_IF_ELSE_PTX = r"""
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry cfg_ifelse_smoke_kernel(
+    .param .u64 cfg_ifelse_smoke_kernel_param_0,
+    .param .u64 cfg_ifelse_smoke_kernel_param_1,
+    .param .u32 cfg_ifelse_smoke_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [cfg_ifelse_smoke_kernel_param_0];
+    ld.param.u64 %rd2, [cfg_ifelse_smoke_kernel_param_1];
+    ld.param.u32 %r1, [cfg_ifelse_smoke_kernel_param_2];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mov.u32 %r2, %tid.x;
+    mul.wide.s32 %rd5, %r2, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    ld.global.u32 %r3, [%rd6];
+    setp.gt.s32 %p1, %r3, %r1;
+    @%p1 bra $L_then;
+    sub.s32 %r4, %r3, 1;
+    bra $L_join;
+$L_then:
+    add.s32 %r4, %r3, 1;
+$L_join:
+    add.s64 %rd7, %rd4, %rd5;
+    st.global.u32 [%rd7], %r4;
     ret;
 }
 """
@@ -225,14 +266,47 @@ class ControlFlowHumanLabelsTest(unittest.TestCase):
         self.assertNotIn("Decisão Composta", mermaid)
 
     def test_dynamic_smoke_trace_counts_taken_and_fallthrough_threads(self):
-        analyzer = PTXAnalyzer.from_string(SIMPLE_IF_ELSE_PTX)
-        data = analyzer.dynamic_flow(sample_input=[4, 1, 9, 2], threshold=3, mode="data")
+        # Executa o PTX de verdade (executor genérico) em vez de reconhecer
+        # o kernel pelo nome e reproduzir a lógica em Python.
+        analyzer = PTXAnalyzer.from_string(PARAM_IF_ELSE_PTX)
+        kernel_args = [
+            KernelArg(index=0, kind="buffer", values=[4, 1, 9, 2], label="input"),
+            KernelArg(index=1, kind="buffer", values=[0, 0, 0, 0], label="output"),
+            KernelArg(index=2, kind="scalar", value=3, label="threshold"),
+        ]
+        data = analyzer.dynamic_flow(
+            kernel_args=kernel_args,
+            grid_dim=(1, 1, 1),
+            block_dim=(4, 1, 1),
+            expected_output={"output": [5, 0, 10, 1]},
+            mode="data",
+        )
         dynamic = data["dynamic_flow"]
 
-        self.assertEqual(dynamic["sample_output"], [5, 0, 10, 1])
+        self.assertEqual(dynamic["sample_output"]["output"], [5, 0, 10, 1])
         self.assertEqual(dynamic["branch_activity"][0]["taken_count"], 2)
         self.assertEqual(dynamic["branch_activity"][0]["fallthrough_count"], 2)
         self.assertIn("__ENTRY__", dynamic["block_hits"])
+        self.assertEqual(dynamic["unsupported_ops"], [])
+        self.assertTrue(all(item["match"] for item in dynamic["validation"]))
+
+    def test_dynamic_trace_reports_validation_mismatch_honestly(self):
+        analyzer = PTXAnalyzer.from_string(PARAM_IF_ELSE_PTX)
+        kernel_args = [
+            KernelArg(index=0, kind="buffer", values=[4, 1, 9, 2], label="input"),
+            KernelArg(index=1, kind="buffer", values=[0, 0, 0, 0], label="output"),
+            KernelArg(index=2, kind="scalar", value=3, label="threshold"),
+        ]
+        data = analyzer.dynamic_flow(
+            kernel_args=kernel_args,
+            grid_dim=(1, 1, 1),
+            block_dim=(4, 1, 1),
+            expected_output={"output": [0, 0, 0, 0]},
+            mode="data",
+        )
+        dynamic = data["dynamic_flow"]
+        self.assertFalse(dynamic["validation"][0]["match"])
+        self.assertTrue(any("Divergência" in note for note in dynamic["notes"]))
 
 
 if __name__ == "__main__":
