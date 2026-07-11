@@ -121,6 +121,78 @@ UNSUPPORTED_OP_PTX = r"""
 }
 """
 
+VECTOR_LOCAL_PTX = r"""
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry vector_local_kernel(
+    .param .u64 vector_local_kernel_param_0
+)
+{
+    .local .align 16 .b8 __local_depot0[16];
+    .reg .b64 %SPL;
+    .reg .b64 %rd<8>;
+    .reg .b32 %r<8>;
+
+    mov.u64 %SPL, __local_depot0;
+    ld.param.u64 %rd1, [vector_local_kernel_param_0];
+    cvta.to.global.u64 %rd2, %rd1;
+    add.u64 %rd3, %SPL, 0;
+
+    ld.global.u32 %r1, [%rd2];
+    ld.global.u32 %r2, [%rd2+4];
+    ld.global.u32 %r3, [%rd2+8];
+    ld.global.u32 %r4, [%rd2+12];
+    st.local.v4.u32 [%rd3], {%r1, %r2, %r3, %r4};
+    ld.local.v4.u32 {%r5, %r6, %r7, %r1}, [%rd3];
+    st.global.u32 [%rd2], %r5;
+    st.global.u32 [%rd2+4], %r6;
+    st.global.u32 [%rd2+8], %r7;
+    st.global.u32 [%rd2+12], %r1;
+    ret;
+}
+"""
+
+BARRIER_SHARED_PTX = r"""
+.version 7.0
+.target sm_75
+.address_size 64
+
+.extern .shared .align 4 .b8 shared_segment[];
+
+.visible .entry barrier_shared_kernel(
+    .param .u64 barrier_shared_kernel_param_0
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [barrier_shared_kernel_param_0];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 2;
+    mov.u32 %r3, shared_segment;
+    add.s32 %r4, %r3, %r2;
+    mul.wide.s32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r5, [%rd4];
+    st.shared.u32 [%r4], %r5;
+    bar.sync 0;
+    setp.ne.s32 %p1, %r1, 0;
+    @%p1 bra $L_after_write;
+    ld.shared.u32 %r6, [%r3];
+    add.s32 %r7, %r6, 10;
+    st.shared.u32 [%r3+4], %r7;
+$L_after_write:
+    bar.sync 0;
+    ld.shared.u32 %r8, [%r4];
+    st.global.u32 [%rd4], %r8;
+    ret;
+}
+"""
+
 
 def _units_by_role(code: str):
     units = parse_ptx(code)
@@ -182,6 +254,26 @@ class GenericInterpreterTest(unittest.TestCase):
         self.assertEqual(len(trace.threads), 2)
         for thread in trace.threads:
             self.assertEqual(thread.halt_reason, "ret")
+
+    def test_vector_local_load_store_is_supported_for_register_style_kernels(self):
+        kernel, functions = _units_by_role(VECTOR_LOCAL_PTX)
+        interp = PTXInterpreter(kernel, functions=functions, raw_ptx=VECTOR_LOCAL_PTX)
+        interp.load_args([KernelArg(index=0, kind="buffer", values=[9, 4, 7, 2], label="data")])
+        trace = interp.run(KernelLaunchConfig(grid_dim=(1, 1, 1), block_dim=(1, 1, 1)))
+
+        self.assertEqual(trace.buffers_after[0], [9, 4, 7, 2])
+        self.assertEqual(trace.unsupported_ops, [])
+        self.assertEqual(trace.threads[0].halt_reason, "ret")
+
+    def test_bar_sync_coordinates_threads_with_shared_memory(self):
+        kernel, functions = _units_by_role(BARRIER_SHARED_PTX)
+        interp = PTXInterpreter(kernel, functions=functions, raw_ptx=BARRIER_SHARED_PTX)
+        interp.load_args([KernelArg(index=0, kind="buffer", values=[5, 2], label="data")])
+        trace = interp.run(KernelLaunchConfig(grid_dim=(1, 1, 1), block_dim=(2, 1, 1)))
+
+        self.assertEqual(trace.buffers_after[0], [5, 15])
+        self.assertEqual(trace.unsupported_ops, [])
+        self.assertEqual([thread.halt_reason for thread in trace.threads], ["ret", "ret"])
 
 
 if __name__ == "__main__":

@@ -1792,11 +1792,10 @@ class PTXAnalyzer:
             "Traço dinâmico obtido executando o PTX real (executor genérico, não uma "
             "heurística por algoritmo): cada thread simulada percorre o CFG a partir dos "
             "valores concretos fornecidos, avaliando predicados/branches de verdade.",
-            "Threads são executadas sequencialmente (sem concorrência real); "
-            "bar.sync/membar são tratados como marcadores, não como barreiras de fato — "
-            "kernels que dependem de __syncthreads() para dividir trabalho entre threads "
-            "de um mesmo bloco podem produzir saída divergente da GPU real (ver docstring "
-            "de ptx_analyzer.interpreter).",
+            "Quando o kernel usa bar.sync, o simulador intercala as threads do mesmo CTA "
+            "até a barreira e só libera quando todas as threads ativas chegam nela; "
+            "fora desses pontos, a execução continua determinística (não modela o "
+            "scheduler real da GPU nem interleavings arbitrários).",
         ]
         if ktrace.unsupported_ops:
             notes.append(

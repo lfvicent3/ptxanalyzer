@@ -105,17 +105,186 @@ def _resolve_visual_target(blocks: dict, label: str) -> str:
 
 
 def _block_summary(label: str, block: dict) -> dict:
+    raw_instruction_name = (block.get("raw_instruction_name") or "").strip()
+    ptx_name = raw_instruction_name.split(" + ", 1)[0].strip() if raw_instruction_name else ""
     return {
         "id": label,
-        "label": block.get("title") or block.get("display_name") or label,
+        "label": block.get("display_name") or block.get("title") or label,
         "instruction_name": block.get("instruction_name") or "",
+        "raw_instruction_name": raw_instruction_name,
+        "ptx_name": ptx_name,
         "description": block.get("description") or "",
         "source_line": block.get("source_line") or 0,
         "source_code": (block.get("source_code") or "").strip(),
+        "inline_source_line": block.get("inline_source_line") or 0,
+        "inline_source_code": (block.get("inline_source_code") or "").strip(),
         "is_entry": bool(block.get("is_entry")),
         "is_terminal": bool(block.get("is_terminal")),
         "instruction_count": block.get("instruction_count", 0),
+        "repeated_source_instance": int(block.get("repeated_source_instance") or 0),
     }
+
+
+def _decision_source_key(block: dict) -> tuple[str, int]:
+    source_line = int(block.get("source_line") or 0)
+    inline_line = int(block.get("inline_source_line") or 0)
+    source_code = (block.get("source_code") or "").strip()
+    inline_source_code = (block.get("inline_source_code") or "").strip()
+    reference_code = source_code or inline_source_code
+    has_compound_operator = ("&&" in reference_code) or ("||" in reference_code)
+    if reference_code and not has_compound_operator:
+        return ("none", 0)
+    if source_line > 0:
+        return ("source", source_line)
+    if inline_line > 0:
+        return ("inline", inline_line)
+    return ("none", 0)
+
+
+def _compute_graph_groups(blocks: dict, order: list[str], visible_labels: list[str], control_flow: dict) -> list[dict]:
+    visible_set = set(visible_labels)
+
+    def is_decision_block(label: str) -> bool:
+        return any((exit_info.get("type") == "conditional") for exit_info in (blocks[label].get("exits") or []))
+
+    groups: list[dict] = []
+    grouped_labels: set[str] = set()
+
+    current: list[str] = []
+    current_key: tuple[str, int] | None = None
+    compound_idx = 0
+    for label in order:
+        if label not in visible_set:
+            if len(current) > 1:
+                compound_idx += 1
+                groups.append({
+                    "id": f"compound_{compound_idx}",
+                    "kind": "compound_decision",
+                    "label": f"Decisão Composta {compound_idx}",
+                    "members": current[:],
+                })
+                grouped_labels.update(current)
+            current = []
+            current_key = None
+            continue
+        if is_decision_block(label):
+            decision_key = _decision_source_key(blocks[label])
+            if decision_key == ("none", 0):
+                if len(current) > 1:
+                    compound_idx += 1
+                    groups.append({
+                        "id": f"compound_{compound_idx}",
+                        "kind": "compound_decision",
+                        "label": f"Decisão Composta {compound_idx}",
+                        "members": current[:],
+                    })
+                    grouped_labels.update(current)
+                current = []
+                current_key = None
+                continue
+            if not current:
+                current = [label]
+                current_key = decision_key
+            elif decision_key == current_key:
+                current.append(label)
+            else:
+                if len(current) > 1:
+                    compound_idx += 1
+                    groups.append({
+                        "id": f"compound_{compound_idx}",
+                        "kind": "compound_decision",
+                        "label": f"Decisão Composta {compound_idx}",
+                        "members": current[:],
+                    })
+                    grouped_labels.update(current)
+                current = [label]
+                current_key = decision_key
+        else:
+            if len(current) > 1:
+                compound_idx += 1
+                groups.append({
+                    "id": f"compound_{compound_idx}",
+                    "kind": "compound_decision",
+                    "label": f"Decisão Composta {compound_idx}",
+                    "members": current[:],
+                })
+                grouped_labels.update(current)
+            current = []
+            current_key = None
+    if len(current) > 1:
+        compound_idx += 1
+        groups.append({
+            "id": f"compound_{compound_idx}",
+            "kind": "compound_decision",
+            "label": f"Decisão Composta {compound_idx}",
+            "members": current[:],
+        })
+        grouped_labels.update(current)
+
+    order_index = {label: idx for idx, label in enumerate(order)}
+    loop_sites = control_flow.get("loop_sites") or []
+    unroll_idx = 0
+    rendered_unroll_groups: list[tuple[list[str], int, int]] = []
+    for loop in loop_sites:
+        header = loop.get("header")
+        latch = loop.get("latch")
+        if header not in order_index or latch not in order_index:
+            continue
+        header_idx = order_index[header]
+        latch_idx = order_index[latch]
+        if latch_idx < header_idx:
+            continue
+        span = [label for label in order[header_idx:latch_idx + 1] if label in visible_set]
+        if len(span) < 2 or any(label in grouped_labels for label in span):
+            continue
+        line_counts: dict[int, int] = {}
+        for label in span:
+            line = int(blocks[label].get("source_line") or 0)
+            if line > 0:
+                line_counts[line] = line_counts.get(line, 0) + 1
+        if not line_counts:
+            continue
+        body_line, factor = max(line_counts.items(), key=lambda item: item[1])
+        if factor < 2:
+            continue
+        unroll_idx += 1
+        groups.append({
+            "id": f"unroll_{unroll_idx}",
+            "kind": "unroll",
+            "label": f"Desenrolado por fator {factor} (linha {body_line})",
+            "members": span[:],
+        })
+        grouped_labels.update(span)
+        rendered_unroll_groups.append((span[:], factor, body_line))
+
+    branch_by_label = {site.get("block_label"): site for site in (control_flow.get("branch_sites") or [])}
+    remainder_idx = 0
+    for span, factor, _body_line in rendered_unroll_groups:
+        header, latch = span[0], span[-1]
+        latch_block = blocks.get(latch) or {}
+        exit_target = next((edge.get("target") for edge in (latch_block.get("exits") or []) if edge.get("target") != header), None)
+        exit_site = branch_by_label.get(exit_target)
+        join_target = exit_site.get("reconvergence_target") if exit_site else None
+        if exit_target not in order_index or join_target not in order_index:
+            continue
+        start_idx = order_index[exit_target]
+        end_idx = order_index[join_target]
+        if end_idx <= start_idx:
+            continue
+        remainder = [label for label in order[start_idx:end_idx] if label in visible_set]
+        if len(remainder) < 2 or any(label in grouped_labels for label in remainder):
+            continue
+        remainder_idx += 1
+        extra_label = "iteração restante" if factor - 1 == 1 else "iterações restantes"
+        groups.append({
+            "id": f"remainder_{remainder_idx}",
+            "kind": "remainder",
+            "label": f"Resto do desenrolamento (até {factor - 1} {extra_label})",
+            "members": remainder[:],
+        })
+        grouped_labels.update(remainder)
+
+    return groups
 
 
 def _load_source_lines(source_path: Optional[str]) -> list[str]:
@@ -237,6 +406,7 @@ def _build_payload(result: dict,
             kind = "normal"
         summary["kind"] = kind
         nodes.append(summary)
+    graph_groups = _compute_graph_groups(blocks, order, visible_labels, control_flow)
 
     # ── caminho de cada thread, com blocos-stub colapsados no bloco real
     # que representam e visitas consecutivas repetidas fundidas ─────────
@@ -298,6 +468,7 @@ def _build_payload(result: dict,
     payload = {
         "meta": dict(meta or {}),
         "nodes": nodes,
+        "graph_groups": graph_groups,
         "edges": edge_list,
         "threads": thread_rows,
         "total_threads": len(thread_rows),
@@ -512,14 +683,35 @@ _APP_JS = r"""
 
   function initCytoscape() {
     var elements = [];
+    var groupByMember = {};
+    (DATA.graph_groups || []).forEach(function (g) {
+      elements.push({
+        data: {
+          id: g.id,
+          label: g.label,
+          kind: g.kind,
+          is_group: 1,
+          heat: 0,
+          active: 0,
+          baseLabel: g.label,
+          display: g.label,
+        },
+      });
+      (g.members || []).forEach(function (memberId) {
+        groupByMember[memberId] = g.id;
+      });
+    });
     DATA.nodes.forEach(function (n) {
       var titleLine = n.label;
-      var subLine = n.instruction_name || n.description || "";
-      var baseLabel = titleLine + (subLine ? ("\n" + subLine) : "");
+      var detailLine = n.description || n.instruction_name || "";
+      var ptxLine = n.ptx_name ? ("PTX: " + n.ptx_name) : "";
+      var baseLabel = [titleLine, detailLine, ptxLine].filter(Boolean).join("\n");
       elements.push({
         data: {
           id: n.id, kind: n.kind, heat: 0, active: 0,
+          parent: groupByMember[n.id] || "",
           baseLabel: baseLabel, display: baseLabel,
+          is_group: 0,
         },
       });
     });
@@ -541,13 +733,59 @@ _APP_JS = r"""
           selector: "node",
           style: {
             shape: "round-rectangle",
+            label: "data(display)",
+            "text-wrap": "wrap",
+            "font-size": "11px",
+            color: "#0f172a",
+          },
+        },
+        {
+          selector: "node[is_group = 1]",
+          style: {
+            shape: "round-rectangle",
+            "background-color": "#f8fafc",
+            "background-opacity": 0.22,
+            "border-width": 2,
+            "border-color": "#94a3b8",
+            "border-style": "solid",
+            "text-valign": "top",
+            "text-halign": "center",
+            "font-size": "12px",
+            "font-weight": 700,
+            color: "#1e293b",
+            padding: "18px",
+          },
+        },
+        {
+          selector: 'node[kind = "compound_decision"]',
+          style: {
+            "border-color": "#ef4444",
+            "background-color": "#fff1f2",
+          },
+        },
+        {
+          selector: 'node[kind = "unroll"]',
+          style: {
+            "border-color": "#60a5fa",
+            "background-color": "#eff6ff",
+          },
+        },
+        {
+          selector: 'node[kind = "remainder"]',
+          style: {
+            "border-color": "#f59e0b",
+            "background-color": "#fffbeb",
+          },
+        },
+        {
+          selector: "node[is_group = 0]",
+          style: {
+            shape: "round-rectangle",
             "background-color": function (ele) { return KIND_COLOR[ele.data("kind")] || "#334155"; },
             "background-opacity": 0.12,
             "border-width": 2,
             "border-color": function (ele) { return KIND_COLOR[ele.data("kind")] || "#334155"; },
-            label: "data(display)",
-            "text-wrap": "wrap",
-            "text-max-width": "170px",
+            "text-max-width": "230px",
             "font-size": "11px",
             color: "#0f172a",
             "text-valign": "center",
@@ -652,6 +890,7 @@ _APP_JS = r"""
     if (cy) {
       cy.batch(function () {
         cy.nodes().forEach(function (n) {
+          if (n.data("is_group")) return;
           var id = n.id();
           var done = counts.completed[id] || 0;
           var visits = counts.visits[id] || 0;

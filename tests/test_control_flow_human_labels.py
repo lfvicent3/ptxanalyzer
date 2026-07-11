@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ptx_analyzer import KernelArg, PTXAnalyzer, build_cfg
+from ptx_analyzer.dynamic_view import _build_payload
 
 
 SIMPLE_IF_ELSE_PTX = r"""
@@ -258,6 +259,13 @@ class ControlFlowHumanLabelsTest(unittest.TestCase):
         self.assertEqual(second_block["instruction_name"], "comparação condicional")
         self.assertEqual(first_block["raw_instruction_name"], "setp.gt.s32 + bra")
         self.assertEqual(second_block["raw_instruction_name"], "setp.lt.s32 + bra")
+
+        payload = _build_payload(data, warp_size=32, meta={})
+        group_labels = [group["label"] for group in payload["graph_groups"]]
+        self.assertIn("Decisão Composta 1", group_labels)
+        node_entry = next(node for node in payload["nodes"] if node["id"] == "__ENTRY__")
+        self.assertEqual(node_entry["label"], "Entrada")
+        self.assertEqual(node_entry["ptx_name"], "setp.gt.s32")
 
     def test_compound_decision_group_is_not_rendered_for_distinct_conditions(self):
         analyzer = PTXAnalyzer.from_string(SEQUENTIAL_CONDITIONS_PTX)

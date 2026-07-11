@@ -22,9 +22,9 @@ Suportado hoje (ver `SUPPORTED_OPCODES`):
   - memória: `ld`/`st` em `.global`/`.shared`/`.local`/`.param`,
     endereçamento genérico byte a byte (qualquer largura/sinal/float
     conforme o sufixo do opcode)
-  - sincronização: `bar.sync`/`membar`/`fence`/`nop` como marcadores sem
-    efeito de dados (threads são executadas sequencialmente, não há
-    concorrência real neste modelo)
+  - sincronização: `bar.sync` sincroniza threads do mesmo CTA (scheduler
+    cooperativo por bloco quando o kernel usa barreiras); `membar`/
+    `fence`/`nop` seguem como marcadores sem efeito de dados
 
 Não suportado ainda (fica como `unsupported_ops` no traço, sem travar o
 processo inteiro nem inventar um resultado): `div`/`rem`, `mul.hi`/
@@ -35,19 +35,13 @@ ponteiro de função. Para estender: adicione um novo ramo em
 dedicado) — o resto do motor (CFG, memória, traço) já é genérico e não
 precisa mudar.
 
-Limitação estrutural conhecida (não é bug, é o modelo escolhido): as
-threads são executadas **sequencialmente, uma até o fim, depois a
-próxima** — não há concorrência real nem escalonamento por warp.
-`bar.sync`/`membar` são tratados como marcadores sem efeito. Isso é fiel
-o suficiente quando cada thread é independente (um segmento por thread em
-memória global), mas produz resultado **incorreto** em kernels que usam
-`__syncthreads()` para coordenar um trabalho dividido entre as threads de
-um mesmo bloco (ex.: variantes "shared" que carregam o segmento inteiro
-em paralelo e só depois ordenam com uma thread líder) — o traço aponta os
-blocos/arestas realmente executados, mas o valor final do buffer pode
-divergir do resultado real da GPU nesses casos. Modelar barreiras de
-verdade exigiria intercalar as threads de um bloco em vez de rodá-las uma
-a uma; é a extensão mais natural deste executor daqui para frente.
+Limitação estrutural conhecida (não é bug, é o modelo escolhido): fora
+dos pontos de `bar.sync`, as threads continuam sendo executadas de forma
+determinística pelo scheduler do simulador, não por um modelo completo de
+concorrência/warp scheduling da GPU real. Isso já é suficiente para
+kernels cooperativos clássicos com `__shared__ + __syncthreads()`, mas
+não modela interleavings arbitrários, atomics ou efeitos de memória mais
+avançados.
 """
 
 from __future__ import annotations
@@ -151,12 +145,23 @@ def _last_type_token(op: str) -> Optional[str]:
     return None
 
 
+def _vector_width(op: str) -> int:
+    for part in op.split("."):
+        if part.startswith("v") and part[1:].isdigit():
+            return int(part[1:])
+    return 1
+
+
 def _classify_space(op: str) -> Optional[str]:
     parts = set(op.split("."))
     for token in _SPACE_TOKENS:
         if token in parts:
             return token
     return None
+
+
+def _normalize_vector_operands(ops: List[str]) -> List[str]:
+    return [op.strip().strip("{}").strip() for op in ops]
 
 
 def build_reg_type_map(kernel: PTXKernel) -> Dict[str, str]:
@@ -177,6 +182,21 @@ class _KernelScope:
     blocks: Dict[str, BasicBlock]
     order: List[str]
     reg_types: Dict[str, str]
+
+
+@dataclass
+class _ThreadExecState:
+    ctx: ThreadContext
+    trace: ThreadTrace
+    frame: Frame
+    current_label: Optional[str]
+    instr_index: int = 0
+    steps: int = 0
+    halted: bool = False
+    halt_reason: str = ""
+    waiting_barrier: Optional[Tuple[str, int, str]] = None
+    snapshot_buffers: bool = False
+    needs_block_entry: bool = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -293,6 +313,7 @@ class PTXInterpreter:
         self._named_symbol_space = _discover_named_symbols(raw_ptx)
         self._named_symbol_base: Dict[str, int] = {}
         self._named_symbol_next: Dict[str, int] = {}
+        self._entry_has_barrier = any(instr.op_base == "bar" for instr in kernel.instructions)
 
     def _alloc_named_symbol(self, space: str) -> int:
         base = self._named_symbol_next.get(space, 0)
@@ -368,19 +389,19 @@ class PTXInterpreter:
         trace = ThreadTrace(thread_id=ctx.thread_id, tid=ctx.tid, ctaid=ctx.ctaid)
         entry_frame = Frame(param_values=dict(self.param_values),
                              pointer_param_indices=set(self.pointer_param_indices))
-        halt_reason = self._run_frame(self._entry_scope, ctx, entry_frame, call_depth=0,
-                                       trace=trace, snapshot_buffers=snapshot_buffers)
+        halt_reason = self._run_frame_serial(self._entry_scope, ctx, entry_frame, call_depth=0,
+                                             trace=trace, snapshot_buffers=snapshot_buffers)
         trace.halted = True
         trace.halt_reason = halt_reason
         return trace
 
-    def _run_frame(self,
-                   scope: _KernelScope,
-                   ctx: ThreadContext,
-                   frame: Frame,
-                   call_depth: int,
-                   trace: Optional[ThreadTrace] = None,
-                   snapshot_buffers: bool = False) -> str:
+    def _run_frame_serial(self,
+                          scope: _KernelScope,
+                          ctx: ThreadContext,
+                          frame: Frame,
+                          call_depth: int,
+                          trace: Optional[ThreadTrace] = None,
+                          snapshot_buffers: bool = False) -> str:
         current_label = scope.order[0] if scope.order else None
         steps = 0
         while current_label:
@@ -432,6 +453,156 @@ class PTXInterpreter:
                     trace.edges_taken.append((current_label, next_label))
             current_label = next_label
         return "ret"
+
+    def _leave_block(self, state: _ThreadExecState, block_label: str) -> None:
+        if state.snapshot_buffers:
+            state.trace.block_snapshots.append((block_label, self.buffers_snapshot()))
+
+    def _advance_to_next_block(self,
+                               state: _ThreadExecState,
+                               block: BasicBlock,
+                               chosen: Optional[str] = None) -> None:
+        next_label = chosen
+        if next_label is None:
+            exits = block.exits
+            next_label = exits[0][1] if exits else None
+            if next_label and state.trace is not None:
+                state.trace.edges_taken.append((block.label, next_label))
+        self._leave_block(state, block.label)
+        state.current_label = next_label
+        state.instr_index = 0
+        state.needs_block_entry = True
+        if next_label is None:
+            state.halted = True
+            state.halt_reason = "ret"
+            state.trace.halted = True
+            state.trace.halt_reason = "ret"
+
+    def _barrier_token(self, block_label: str, instr_index: int, instr: PTXInstruction) -> Tuple[str, int, str]:
+        barrier_id = instr.operands[0].strip() if instr.operands else "0"
+        return (block_label, instr_index, barrier_id)
+
+    def _step_thread_state(self, state: _ThreadExecState) -> bool:
+        if state.halted or state.waiting_barrier is not None:
+            return False
+        if state.current_label is None:
+            state.halted = True
+            state.halt_reason = "ret"
+            state.trace.halted = True
+            state.trace.halt_reason = "ret"
+            return True
+
+        block = self._entry_scope.blocks.get(state.current_label)
+        if block is None:
+            state.halted = True
+            state.halt_reason = f"bloco desconhecido: {state.current_label}"
+            state.trace.halted = True
+            state.trace.halt_reason = state.halt_reason
+            return True
+
+        if state.needs_block_entry:
+            state.steps += 1
+            if state.steps > self.max_steps:
+                state.halted = True
+                state.halt_reason = "limite de passos excedido (possível laço sem convergência)"
+                state.trace.halted = True
+                state.trace.halt_reason = state.halt_reason
+                return True
+            state.trace.blocks_visited.append(state.current_label)
+            state.trace.steps_executed = state.steps
+            state.needs_block_entry = False
+
+        if state.instr_index >= len(block.instructions):
+            self._advance_to_next_block(state, block)
+            return True
+
+        instr = block.instructions[state.instr_index]
+        frame = state.frame
+        ctx = state.ctx
+
+        if instr.op_base != "bra" and instr.is_predicated:
+            pred_name = instr.predicate.lstrip("@").lstrip("!")
+            negate = instr.predicate.startswith("@!")
+            pred_val = bool(frame.predicates.get(pred_name, False))
+            if negate:
+                pred_val = not pred_val
+            if not pred_val:
+                state.instr_index += 1
+                return True
+
+        if instr.op_base == "bra":
+            chosen = self._resolve_branch(frame, block, instr, state.trace)
+            self._advance_to_next_block(state, block, chosen=chosen)
+            return True
+
+        if instr.op_base in ("ret", "exit"):
+            self._leave_block(state, block.label)
+            state.halted = True
+            state.halt_reason = "ret"
+            state.trace.halted = True
+            state.trace.halt_reason = "ret"
+            return True
+
+        if instr.op_base == "bar":
+            state.waiting_barrier = self._barrier_token(block.label, state.instr_index, instr)
+            return True
+
+        try:
+            self._execute_instruction(self._entry_scope, ctx, frame, instr, call_depth=0)
+        except UnsupportedInstruction as exc:
+            self.unsupported_ops.append(instr.op)
+            state.trace.unsupported_ops.append(instr.op)
+            state.halted = True
+            state.halt_reason = f"instrução não suportada ({instr.op}): {exc}"
+            state.trace.halted = True
+            state.trace.halt_reason = state.halt_reason
+            return True
+
+        state.instr_index += 1
+        return True
+
+    def _run_cta_threads(self, cta_states: List[_ThreadExecState]) -> List[ThreadTrace]:
+        while True:
+            if all(state.halted for state in cta_states):
+                break
+
+            progress = False
+            for state in cta_states:
+                if self._step_thread_state(state):
+                    progress = True
+
+            active_states = [state for state in cta_states if not state.halted]
+            waiting_states = [state for state in active_states if state.waiting_barrier is not None]
+            if waiting_states:
+                tokens = {state.waiting_barrier for state in waiting_states}
+                if len(waiting_states) == len(active_states) and len(tokens) == 1:
+                    for state in waiting_states:
+                        state.waiting_barrier = None
+                        state.instr_index += 1
+                    progress = True
+                elif len(waiting_states) == len(active_states):
+                    deadlock = (
+                        "deadlock em bar.sync: threads ativas do CTA chegaram a barreiras "
+                        "diferentes, o que indica sincronização divergente não suportada"
+                    )
+                    for state in active_states:
+                        state.halted = True
+                        state.halt_reason = deadlock
+                        state.trace.halted = True
+                        state.trace.halt_reason = deadlock
+                    break
+
+            if not progress:
+                stalled = [state for state in cta_states if not state.halted]
+                reason = "execução estagnou sem progresso (possível sincronização não suportada)"
+                for state in stalled:
+                    state.halted = True
+                    state.halt_reason = reason
+                    state.trace.halted = True
+                    state.trace.halt_reason = reason
+                break
+
+        return [state.trace for state in cta_states]
 
     def _resolve_branch(self,
                          frame: Frame,
@@ -631,58 +802,72 @@ class PTXInterpreter:
         raise UnsupportedInstruction(f"endereço base não suportado (símbolo global direto): {base!r}")
 
     def _execute_ld(self, reg_types, ctx, frame, instr: PTXInstruction) -> None:
-        dst, mem_operand = instr.operands[0], instr.operands[1]
         space = _classify_space(instr.op)
         type_token = _last_type_token(instr.op) or "u32"
         width = _type_width_bytes(type_token)
         is_float = type_token.startswith("f")
         signed = type_token.startswith("s")
+        vec_width = _vector_width(instr.op)
+        if len(instr.operands) < vec_width + 1:
+            raise UnsupportedInstruction(f"forma vetorial de ld não suportada: {instr.raw}")
+        dst_operands = _normalize_vector_operands(instr.operands[:vec_width])
+        mem_operand = instr.operands[vec_width]
 
         if space == "param":
+            if vec_width != 1:
+                raise UnsupportedInstruction(f"ld.param vetorial ainda não é suportado: {instr.raw}")
             symbol = mem_operand.strip("[]").split("+")[0].strip()
             idx = self._resolve_param_symbol(symbol)
             if idx is not None:
                 if idx not in frame.param_values:
                     raise UnsupportedInstruction(f"valor não fornecido para o parâmetro {idx} ({symbol})")
-                _write_register(reg_types, frame, dst, frame.param_values[idx])
+                _write_register(reg_types, frame, dst_operands[0], frame.param_values[idx])
                 if idx in frame.pointer_param_indices:
-                    frame.reg_space[dst] = "global"
+                    frame.reg_space[dst_operands[0]] = "global"
             else:
                 # `.param` local de um callseq (ex.: retval0) — não é um
                 # parâmetro da assinatura do kernel/função.
-                _write_register(reg_types, frame, dst, frame.call_scratch.get(symbol, 0))
+                _write_register(reg_types, frame, dst_operands[0], frame.call_scratch.get(symbol, 0))
                 if frame.call_scratch_space.get(symbol):
-                    frame.reg_space[dst] = frame.call_scratch_space[symbol]
+                    frame.reg_space[dst_operands[0]] = frame.call_scratch_space[symbol]
             return
 
         base, offset = _parse_memory_operand(mem_operand)
         addr = self._eval_address(reg_types, ctx, frame, base) + offset
         mem_space = space or frame.reg_space.get(base, "global")
         memory = self._memory_for(mem_space, ctx)
-        value = memory.read_value(addr, width, is_float, signed)
-        _write_register(reg_types, frame, dst, value)
+        for i, dst in enumerate(dst_operands):
+            value = memory.read_value(addr + i * width, width, is_float, signed)
+            _write_register(reg_types, frame, dst, value)
 
     def _execute_st(self, reg_types, ctx, frame, instr: PTXInstruction) -> None:
-        mem_operand, src = instr.operands[0], instr.operands[1]
         space = _classify_space(instr.op)
         type_token = _last_type_token(instr.op) or "u32"
         width = _type_width_bytes(type_token)
         is_float = type_token.startswith("f")
+        vec_width = _vector_width(instr.op)
+        if len(instr.operands) < vec_width + 1:
+            raise UnsupportedInstruction(f"forma vetorial de st não suportada: {instr.raw}")
+        mem_operand = instr.operands[0]
+        src_operands = _normalize_vector_operands(instr.operands[1:1 + vec_width])
 
         if space == "param":
+            if vec_width != 1:
+                raise UnsupportedInstruction(f"st.param vetorial ainda não é suportado: {instr.raw}")
             symbol = mem_operand.strip("[]").split("+")[0].strip()
-            value = _eval_operand(reg_types, ctx, frame, src)
+            value = _eval_operand(reg_types, ctx, frame, src_operands[0])
             frame.call_scratch[symbol] = value
-            if src.strip() in frame.reg_space:
-                frame.call_scratch_space[symbol] = frame.reg_space[src.strip()]
+            if src_operands[0].strip() in frame.reg_space:
+                frame.call_scratch_space[symbol] = frame.reg_space[src_operands[0].strip()]
             return
 
         base, offset = _parse_memory_operand(mem_operand)
         addr = self._eval_address(reg_types, ctx, frame, base) + offset
         mem_space = space or frame.reg_space.get(base, "global")
         memory = self._memory_for(mem_space, ctx)
-        value = _eval_operand(reg_types, ctx, frame, src)
-        memory.write_value(addr, value, width, is_float)
+        for i, src in enumerate(src_operands):
+            value = _eval_operand(reg_types, ctx, frame, src)
+            memory.write_value(addr + i * width, value, width, is_float)
 
     def _execute_call(self, ctx: ThreadContext, frame: Frame, instr: PTXInstruction, call_depth: int) -> None:
         match = _RE_CALL_UNI.match(instr.raw.strip())
@@ -709,7 +894,7 @@ class PTXInterpreter:
                 callee_pointer_indices.add(idx)
 
         callee_frame = Frame(param_values=callee_param_values, pointer_param_indices=callee_pointer_indices)
-        halt_reason = self._run_frame(callee_scope, ctx, callee_frame, call_depth + 1, trace=None)
+        halt_reason = self._run_frame_serial(callee_scope, ctx, callee_frame, call_depth + 1, trace=None)
         if halt_reason != "ret":
             raise UnsupportedInstruction(f"chamada a {callee_name!r} não terminou normalmente: {halt_reason}")
 
@@ -747,6 +932,7 @@ class PTXInterpreter:
                 for cta_x in range(gx):
                     cta_index = cta_x + gx * (cta_y + gy * cta_z)
                     shared_mem = shared_mem_by_cta.setdefault(cta_index, ByteMemory())
+                    cta_states: List[_ThreadExecState] = []
                     for tz in range(bz):
                         for ty in range(by):
                             for tx in range(bx):
@@ -763,14 +949,37 @@ class PTXInterpreter:
                                     laneid=linear % launch.warp_size,
                                     warpid=linear // launch.warp_size,
                                 )
-                                trace = self.run_thread(ctx, snapshot_buffers=(thread_id == snapshot_thread))
-                                threads.append(trace)
-                                for label in trace.blocks_visited:
-                                    block_hits[label] = block_hits.get(label, 0) + 1
-                                for src, dst in trace.edges_taken:
-                                    key = f"{src}->{dst}"
-                                    edge_hits[key] = edge_hits.get(key, 0) + 1
+                                if self._entry_has_barrier:
+                                    trace = ThreadTrace(thread_id=thread_id, tid=ctx.tid, ctaid=ctx.ctaid)
+                                    entry_frame = Frame(
+                                        param_values=dict(self.param_values),
+                                        pointer_param_indices=set(self.pointer_param_indices),
+                                    )
+                                    cta_states.append(_ThreadExecState(
+                                        ctx=ctx,
+                                        trace=trace,
+                                        frame=entry_frame,
+                                        current_label=self._entry_scope.order[0] if self._entry_scope.order else None,
+                                        snapshot_buffers=(thread_id == snapshot_thread),
+                                    ))
+                                else:
+                                    trace = self.run_thread(ctx, snapshot_buffers=(thread_id == snapshot_thread))
+                                    threads.append(trace)
+                                    for label in trace.blocks_visited:
+                                        block_hits[label] = block_hits.get(label, 0) + 1
+                                    for src, dst in trace.edges_taken:
+                                        key = f"{src}->{dst}"
+                                        edge_hits[key] = edge_hits.get(key, 0) + 1
                                 thread_id += 1
+                    if self._entry_has_barrier:
+                        cta_traces = self._run_cta_threads(cta_states)
+                        threads.extend(cta_traces)
+                        for trace in cta_traces:
+                            for label in trace.blocks_visited:
+                                block_hits[label] = block_hits.get(label, 0) + 1
+                            for src, dst in trace.edges_taken:
+                                key = f"{src}->{dst}"
+                                edge_hits[key] = edge_hits.get(key, 0) + 1
 
         return KernelDynamicTrace(
             threads=threads,
