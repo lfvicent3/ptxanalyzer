@@ -135,6 +135,36 @@ $L_loop:
 }
 """
 
+NESTED_LOOP_FALSE_UNROLL_PTX = r"""
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry nested_loop_kernel()
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+
+    mov.u32 %r1, 0;
+$L_outer:
+    .loc 1 89 5
+    setp.lt.s32 %p1, %r1, %r2;
+    @!%p1 bra $L_end;
+    mov.u32 %r3, 0;
+$L_inner:
+    .loc 1 89 9
+    setp.lt.s32 %p2, %r3, %r4;
+    @!%p2 bra $L_after_inner;
+    add.s32 %r3, %r3, 1;
+    bra $L_inner;
+$L_after_inner:
+    add.s32 %r1, %r1, 1;
+    bra $L_outer;
+$L_end:
+    ret;
+}
+"""
+
 SEQUENTIAL_CONDITIONS_PTX = r"""
 .version 7.0
 .target sm_75
@@ -272,6 +302,14 @@ class ControlFlowHumanLabelsTest(unittest.TestCase):
         mermaid = analyzer.control_flow(mode="raw")
 
         self.assertNotIn("Decisão Composta", mermaid)
+
+    def test_nested_loops_are_not_mistaken_for_unroll_groups_in_payload(self):
+        analyzer = PTXAnalyzer.from_string(NESTED_LOOP_FALSE_UNROLL_PTX)
+        data = analyzer.control_flow(mode="data")
+        payload = _build_payload(data, warp_size=32, meta={})
+
+        unroll_labels = [group["label"] for group in payload["graph_groups"] if group["kind"] == "unroll"]
+        self.assertEqual(unroll_labels, [])
 
     def test_dynamic_smoke_trace_counts_taken_and_fallthrough_threads(self):
         # Executa o PTX de verdade (executor genérico) em vez de reconhecer

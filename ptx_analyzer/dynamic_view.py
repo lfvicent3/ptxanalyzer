@@ -225,20 +225,43 @@ def _compute_graph_groups(blocks: dict, order: list[str], visible_labels: list[s
     loop_sites = control_flow.get("loop_sites") or []
     unroll_idx = 0
     rendered_unroll_groups: list[tuple[list[str], int, int]] = []
-    for loop in loop_sites:
+
+    def span_of(loop: dict) -> tuple[int, int] | None:
         header = loop.get("header")
         latch = loop.get("latch")
         if header not in order_index or latch not in order_index:
-            continue
+            return None
         header_idx = order_index[header]
         latch_idx = order_index[latch]
         if latch_idx < header_idx:
+            return None
+        return header_idx, latch_idx
+
+    for loop in loop_sites:
+        span_range = span_of(loop)
+        if span_range is None:
             continue
+        header_idx, latch_idx = span_range
+
+        nested = False
+        for other in loop_sites:
+            if other is loop:
+                continue
+            other_range = span_of(other)
+            if other_range is None:
+                continue
+            other_header_idx, other_latch_idx = other_range
+            if header_idx <= other_header_idx and other_latch_idx <= latch_idx and other_range != span_range:
+                nested = True
+                break
+        if nested:
+            continue
+
         span = [label for label in order[header_idx:latch_idx + 1] if label in visible_set]
         if len(span) < 2 or any(label in grouped_labels for label in span):
             continue
         line_counts: dict[int, int] = {}
-        for label in span:
+        for label in span[1:]:
             line = int(blocks[label].get("source_line") or 0)
             if line > 0:
                 line_counts[line] = line_counts.get(line, 0) + 1
