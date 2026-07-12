@@ -97,7 +97,7 @@ CALL_PTX = r"""
 }
 """
 
-# `div.s32` está fora do subconjunto suportado hoje — a thread deve
+# `sqrt.rn.f32` continua fora do subconjunto suportado — a thread deve
 # parar honestamente nesse ponto, sem travar o processo nem inventar um
 # resultado.
 UNSUPPORTED_OP_PTX = r"""
@@ -109,14 +109,37 @@ UNSUPPORTED_OP_PTX = r"""
     .param .u64 unsupported_div_kernel_param_0
 )
 {
-    .reg .b32 %r<4>;
+    .reg .f32 %f<3>;
     .reg .b64 %rd<3>;
 
     ld.param.u64 %rd1, [unsupported_div_kernel_param_0];
     cvta.to.global.u64 %rd2, %rd1;
+    ld.global.f32 %f1, [%rd2];
+    sqrt.rn.f32 %f2, %f1;
+    st.global.f32 [%rd2], %f2;
+    ret;
+}
+"""
+
+DIV_REM_PTX = r"""
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry div_rem_kernel(
+    .param .u64 div_rem_kernel_param_0
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+
+    ld.param.u64 %rd1, [div_rem_kernel_param_0];
+    cvta.to.global.u64 %rd2, %rd1;
     ld.global.u32 %r1, [%rd2];
-    div.s32 %r2, %r1, 2;
+    div.u32 %r2, %r1, 4;
+    rem.u32 %r3, %r1, 4;
     st.global.u32 [%rd2], %r2;
+    st.global.u32 [%rd2+4], %r3;
     ret;
 }
 """
@@ -230,19 +253,31 @@ class GenericInterpreterTest(unittest.TestCase):
         self.assertEqual(trace.buffers_after[0], [42])
         self.assertEqual(trace.threads[0].halt_reason, "ret")
 
+    def test_div_and_rem_integer_ops_execute_normally(self):
+        kernel, functions = _units_by_role(DIV_REM_PTX)
+        interp = PTXInterpreter(kernel, functions=functions, raw_ptx=DIV_REM_PTX)
+        interp.load_args([KernelArg(index=0, kind="buffer", values=[14, 0], label="data")])
+        trace = interp.run(KernelLaunchConfig(grid_dim=(1, 1, 1), block_dim=(1, 1, 1)))
+
+        self.assertEqual(trace.buffers_after[0], [3, 2])
+        self.assertEqual(trace.unsupported_ops, [])
+        self.assertEqual(trace.threads[0].halt_reason, "ret")
+
     def test_unsupported_opcode_halts_that_thread_without_crashing_or_faking_a_result(self):
         kernel, functions = _units_by_role(UNSUPPORTED_OP_PTX)
         interp = PTXInterpreter(kernel, functions=functions, raw_ptx=UNSUPPORTED_OP_PTX)
-        interp.load_args([KernelArg(index=0, kind="buffer", values=[10], label="data")])
+        interp.load_args([
+            KernelArg(index=0, kind="buffer", values=[10.0], label="data", element_is_float=True)
+        ])
         trace = interp.run(KernelLaunchConfig(grid_dim=(1, 1, 1), block_dim=(1, 1, 1)))
 
         thread = trace.threads[0]
-        self.assertIn("div.s32", thread.unsupported_ops)
+        self.assertIn("sqrt.rn.f32", thread.unsupported_ops)
         self.assertIn("não suportada", thread.halt_reason)
         # A memória não foi escrita (a instrução falhou antes do st.global),
         # então o buffer permanece com o valor original — nada foi inventado.
-        self.assertEqual(trace.buffers_after[0], [10])
-        self.assertIn("div.s32", trace.unsupported_ops)
+        self.assertEqual(trace.buffers_after[0], [10.0])
+        self.assertIn("sqrt.rn.f32", trace.unsupported_ops)
 
     def test_multiple_threads_share_global_memory_like_real_grid(self):
         kernel, functions = _units_by_role(CALL_PTX)

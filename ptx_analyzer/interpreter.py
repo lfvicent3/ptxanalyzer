@@ -15,7 +15,7 @@ Suportado hoje (ver `SUPPORTED_OPCODES`):
     argumentos, `st.param [func_retvalN+0], ...` para o retorno)
   - dados: `mov`, `cvt`, `cvta`
   - aritmética: `add`, `sub`, `mul` (`.wide` incluso, `.hi` não), `mad`
-    (idem), `min`, `max`, `neg`, `abs`
+    (idem), `div`, `rem`, `min`, `max`, `neg`, `abs`
   - bit a bit: `and`, `or`, `xor`, `not`, `shl`, `shr`
   - comparação/seleção: `setp` (eq/ne/lt/le/gt/ge e variantes
     unsigned lo/ls/hi/hs), `selp`
@@ -27,7 +27,7 @@ Suportado hoje (ver `SUPPORTED_OPCODES`):
     `fence`/`nop` seguem como marcadores sem efeito de dados
 
 Não suportado ainda (fica como `unsupported_ops` no traço, sem travar o
-processo inteiro nem inventar um resultado): `div`/`rem`, `mul.hi`/
+processo inteiro nem inventar um resultado): `mul.hi`/
 `mad.hi`, transcendentais (`sin`/`cos`/`sqrt`/...), operações atômicas,
 `shfl`/warp vote, `ld`/`st` vetoriais (`.v2`/`.v4`), chamadas por
 ponteiro de função. Para estender: adicione um novo ramo em
@@ -111,7 +111,7 @@ _RE_CALL_UNI = re.compile(
 
 SUPPORTED_OPCODES = {
     "mov", "cvt", "cvta",
-    "add", "sub", "mul", "mad", "min", "max", "neg", "abs",
+    "add", "sub", "mul", "mad", "div", "rem", "min", "max", "neg", "abs",
     "and", "or", "xor", "not", "shl", "shr",
     "setp", "selp",
     "ld", "st",
@@ -136,6 +136,11 @@ def _type_is_float(ptx_type: str) -> bool:
 
 def _type_is_signed(ptx_type: str) -> bool:
     return ptx_type.startswith("s")
+
+
+def _trunc_div(a: int, b: int) -> int:
+    quotient = abs(a) // abs(b)
+    return -quotient if (a < 0) ^ (b < 0) else quotient
 
 
 def _last_type_token(op: str) -> Optional[str]:
@@ -704,6 +709,24 @@ class PTXInterpreter:
             b = _eval_operand(reg_types, ctx, frame, ops[2])
             c = _eval_operand(reg_types, ctx, frame, ops[3])
             _write_register(reg_types, frame, ops[0], a * b + c)
+            return
+
+        if op_base in ("div", "rem"):
+            type_token = _last_type_token(instr.op) or "u32"
+            a = _eval_operand(reg_types, ctx, frame, ops[1])
+            b = _eval_operand(reg_types, ctx, frame, ops[2])
+            if b == 0:
+                raise UnsupportedInstruction(f"divisão por zero não é suportada pelo simulador: {instr.raw}")
+            if type_token.startswith("f"):
+                if op_base == "rem":
+                    raise UnsupportedInstruction(f"rem em ponto flutuante ainda não é suportado: {instr.raw}")
+                value = float(a) / float(b)
+            else:
+                ia = int(a)
+                ib = int(b)
+                quotient = _trunc_div(ia, ib)
+                value = quotient if op_base == "div" else ia - quotient * ib
+            _write_register(reg_types, frame, ops[0], value)
             return
 
         if op_base in ("min", "max"):
